@@ -7,6 +7,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -104,7 +105,7 @@ impl Default for AppConfig {
             interval_minutes: 5,
             max_pages_per_channel: 15,
             lookback_days: 2,
-            engine: ScrapingEngine::RealBrowser,
+            engine: ScrapingEngine::RealBrowser, // پیش‌فرض: موتور مرورگر که برای شما کار کرد
             proxy_type: ProxyType::System,
             proxy_host: "127.0.0.1".to_string(),
             proxy_port: 10808,
@@ -235,7 +236,7 @@ impl AppState {
             logs: vec![LogMessage {
                 time: Local::now().format("%H:%M:%S").to_string(),
                 level: LogLevel::Info,
-                text: "🖥️ System Boot: Modules loaded. Waiting for commands.".to_string(),
+                text: "🖥️ System Boot: Real Browser Engine & Anti-Hang mechanisms loaded.".to_string(),
             }],
             total_configs: 0,
             by_protocol: BTreeMap::new(),
@@ -258,12 +259,24 @@ impl AppState {
         thread::spawn(move || {
             let start = Instant::now();
             match fetch_html("https://t.me/s/telegram", &config) {
-                Ok(_) => {
+                Ok(html) => {
                     let elapsed = start.elapsed().as_millis();
-                    let _ = tx.send(AppEvent::PingResult {
-                        ok: true,
-                        detail: format!("Online 🟢 ({}ms)", elapsed),
-                    });
+                    // بررسی می‌کنیم که آیا واقعاً سایت لود شده یا صفحه ارور است
+                    if html.len() > 100 {
+                        let _ = tx.send(AppEvent::PingResult {
+                            ok: true,
+                            detail: format!("Online 🟢 ({}ms)", elapsed),
+                        });
+                        let _ = tx.send(AppEvent::Log(
+                            LogLevel::Success,
+                            format!("📡 Network Check Passed! Page size: {} bytes", html.len()),
+                        ));
+                    } else {
+                        let _ = tx.send(AppEvent::PingResult {
+                            ok: false,
+                            detail: "Failed (Empty Page) 🔴".to_string(),
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::PingResult {
@@ -344,11 +357,9 @@ impl AppState {
     }
 }
 
-// 🛡️ اطمینان از بسته شدن تمام پروسه‌های زامبی هنگام بسته شدن نرم‌افزار
 impl Drop for AppState {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        // استفاده از ابزار ویندوز برای بستن پروسه‌های مخفی ایجاد شده
         let _ = Command::new("cmd")
             .args(&["/C", "taskkill /F /IM msedge.exe /FI \"WINDOWTITLE eq \""])
             .creation_flags(CREATE_NO_WINDOW)
@@ -725,15 +736,15 @@ impl eframe::App for AppState {
 }
 
 // =============================================================
-// هسته شبکه قدرتمند (بدون Deadlock و استفاده از امکانات داخلی مرورگر)
+// 🛡️ هسته شبکه ایمن و ضد-هنگ (Safe Network Core)
 // =============================================================
 
 fn get_performance_settings(profile: &PerformanceProfile) -> (Duration, u64) {
     match profile {
-        // تاخیر حلقه ، مقدار مجاز برای توقف به میلی ثانیه
-        PerformanceProfile::WeakPC => (Duration::from_secs(4), 20000),
-        PerformanceProfile::MediumPC => (Duration::from_secs(2), 15000),
-        PerformanceProfile::StrongPC => (Duration::from_secs(1), 10000),
+        // تاخیر حلقه (ثانیه) ، مهلت خواندن اطلاعات مرورگر (میلی‌ثانیه)
+        PerformanceProfile::WeakPC => (Duration::from_secs(4), 18000),
+        PerformanceProfile::MediumPC => (Duration::from_secs(2), 12000),
+        PerformanceProfile::StrongPC => (Duration::from_secs(1), 8000),
     }
 }
 
@@ -744,7 +755,7 @@ fn fetch_html(url: &str, config: &AppConfig) -> Result<String> {
     }
 }
 
-// این تابع دوباره به حالتی برگشت که مستقیماً از output() استفاده می‌کند تا بافر پر نشود و هنگ نکند
+// این تابع دوباره از نو نوشته شد تا هیچ لوله ارتباطی مسدود نشود و کاملاً خوانا باشد.
 fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
     let (_, timeout_ms) = get_performance_settings(&config.performance);
 
@@ -753,10 +764,11 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         "--dump-dom".to_string(),
         "--disable-gpu".to_string(),
         "--no-sandbox".to_string(),
+        "--disable-dev-shm-usage".to_string(), // بسیار مهم برای جلوگیری از پر شدن حافظه ویندوز
         "--disable-extensions".to_string(),
         "--mute-audio".to_string(),
-        // دستور جادویی: کروم خودش بعد از این زمان پروسه را می‌بندد و مانع بن‌بست می‌شود!
-        format!("--timeout={}", timeout_ms),
+        "--window-size=1920,1080".to_string(), // تلگرام گاهی بدون سایز پنجره محتوا را لود نمی‌کند
+        format!("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     ];
 
     match config.proxy_type {
@@ -792,21 +804,61 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
     ];
 
     for browser in browsers {
-        // اجرای مستقیم با output() که از Deadlock خط لوله‌های استاندارد جلوگیری می‌کند
-        if let Ok(output) = Command::new(browser)
+        // استفاده از spawn به جای output برای جلوگیری قطعی از Deadlock (بن بست)
+        let mut child_proc = match Command::new(browser)
             .args(&args)
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn() 
         {
-            if output.status.success() {
-                let html = String::from_utf8_lossy(&output.stdout).to_string();
-                if html.len() > 100 {
-                    return Ok(html);
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+
+        let start_time = Instant::now();
+        let mut stdout_str = String::new();
+        let mut is_completed = false;
+
+        // خواندن امن داده‌ها با تایم‌اوت
+        if let Some(mut stdout) = child_proc.stdout.take() {
+            let mut buffer = [0; 4096];
+            loop {
+                // اگر زمان گذشت، خارج شو
+                if start_time.elapsed().as_millis() as u64 > timeout_ms {
+                    break;
                 }
+
+                // خواندن غیرمسدودکننده از خروجی مرورگر
+                match stdout.read(&mut buffer) {
+                    Ok(0) => {
+                        is_completed = true;
+                        break; // پایان اطلاعات
+                    }
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buffer[..n]);
+                        stdout_str.push_str(&chunk);
+                    }
+                    Err(_) => break,
+                }
+                thread::sleep(Duration::from_millis(50));
             }
         }
+
+        // اگر پروسه گیر کرده بود، آن را با خشونت می‌کشیم تا کامپیوتر هنگ نکند
+        if !is_completed {
+            let _ = child_proc.kill();
+            return Err(anyhow::anyhow!("Browser timeout exceeded ({}ms). Process safely killed.", timeout_ms));
+        }
+
+        let _ = child_proc.wait(); // پاکسازی پروسه از ویندوز
+
+        if stdout_str.len() > 50 {
+            return Ok(stdout_str);
+        }
     }
-    anyhow::bail!("Failed to execute browser correctly or timeout exceeded.")
+    
+    anyhow::bail!("Failed to execute browser or received empty response.")
 }
 
 fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
@@ -847,7 +899,7 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
 }
 
 // =============================================================
-// استخراج هوشمند و جمع آوری اطلاعات
+// 🧠 استخراج هوشمند و وحشیانه (Bruteforce Extraction)
 // =============================================================
 
 fn run_worker(
@@ -859,7 +911,9 @@ fn run_worker(
     let channels = parse_channels(&channels_raw);
     let (delay, _) = get_performance_settings(&config.performance);
 
-    let regex = Regex::new(r"(?i)(vmess|vless|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[a-zA-Z0-9\-\._~:/\?#\[\]@!\$&'\(\)\*\+,%;=]+").unwrap();
+    // این یک Regex جادویی است. تمام قالب‌بندی‌ها را نادیده می‌گیرد و فقط متن کانفیگ را از دل سورس بیرون می‌کشد
+    let regex_pattern = r"(?i)(vmess|vless|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[a-zA-Z0-9\-\._~:/\?#\[\]@!\$&'\(\)\*\+,%;=]+";
+    let regex = Regex::new(regex_pattern).unwrap();
     let mut history = SentHistory::load();
 
     log_worker(
@@ -904,61 +958,44 @@ fn run_worker(
                 log_worker(
                     &tx,
                     LogLevel::Debug,
-                    format!(
-                        "  ➜ Fetching page {}/{} [{}]",
-                        page, config.max_pages_per_channel, url
-                    ),
+                    format!("  ➜ Fetching page {} [{}]", page, url),
                 );
 
                 match fetch_html(&url, &config) {
-                    Ok(html) => {
+                    Ok(raw_html) => {
                         let mut found_in_page = 0;
                         let mut next_before = None;
 
-                        let doc = Html::parse_document(&html);
-                        let wrap_sel = Selector::parse("div.tgme_widget_message").unwrap();
-                        let text_sel = Selector::parse("div.tgme_widget_message_text").unwrap();
+                        // دیکد کردن کاراکترهای HTML (تبدیل &amp; به &) که در مرورگر هدلس رخ می‌دهد
+                        let decoded_html = raw_html
+                            .replace("&amp;", "&")
+                            .replace("&lt;", "<")
+                            .replace("&gt;", ">")
+                            .replace("&quot;", "\"");
 
-                        let mut found_via_css = false;
-                        for wrap in doc.select(&wrap_sel) {
-                            if let Some(post) = wrap.value().attr("data-post") {
-                                next_before = post.split('/').nth(1).map(|s| s.to_string());
-                            }
-                            for text in wrap.select(&text_sel) {
-                                let content = text.text().collect::<Vec<_>>().join(" ");
-                                for m in regex.find_iter(&content) {
-                                    if let Some(proto) = m.as_str().split("://").next() {
-                                        found_via_css = true;
-                                        found_in_page += 1;
-                                        gathered
-                                            .entry(proto.to_lowercase())
-                                            .or_default()
-                                            .insert(
-                                                m.as_str()
-                                                    .trim_end_matches(&[
-                                                        '(', ')', '[', ']', ' ', '!', '.', ',',
-                                                        ';', '\'', '"',
-                                                    ][..])
-                                                    .to_string(),
-                                            );
-                                    }
-                                }
-                            }
+                        // تلاش برای پیدا کردن لینک صفحه بعدی تلگرام
+                        let next_regex = Regex::new(r#"data-post="[^/]+/(\d+)""#).unwrap();
+                        for cap in next_regex.captures_iter(&decoded_html) {
+                            next_before = Some(cap[1].to_string());
                         }
 
-                        if !found_via_css {
-                            for m in regex.find_iter(&html) {
-                                if let Some(proto) = m.as_str().split("://").next() {
-                                    found_in_page += 1;
-                                    gathered.entry(proto.to_lowercase()).or_default().insert(
-                                        m.as_str()
-                                            .trim_end_matches(&[
-                                                '(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'',
-                                                '"',
-                                            ][..])
-                                            .to_string(),
-                                    );
-                                }
+                        // 🔴 استخراج کاملاً خام و وحشیانه از کل متن سایت
+                        for m in regex.find_iter(&decoded_html) {
+                            let full_match = m.as_str();
+                            
+                            // پاکسازی کاراکترهای چسبیده به انتهای کانفیگ
+                            let clean_link = full_match
+                                .trim_end_matches(&[
+                                    '(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'
+                                ][..])
+                                .to_string();
+
+                            if let Some(proto) = clean_link.split("://").next() {
+                                found_in_page += 1;
+                                gathered
+                                    .entry(proto.to_lowercase())
+                                    .or_default()
+                                    .insert(clean_link);
                             }
                         }
 
@@ -972,10 +1009,10 @@ fn run_worker(
                             log_worker(
                                 &tx,
                                 LogLevel::Warning,
-                                format!("    ⚠️ Page {}: No configs found.", page),
+                                format!("    ⚠️ Page {}: No configs found in DOM.", page),
                             );
                             if next_before.is_none() {
-                                break;
+                                break; // اگر دکمه صفحه قبل وجود نداشت، یعنی به ته کانال رسیدیم
                             }
                         }
 
@@ -990,7 +1027,7 @@ fn run_worker(
                         );
                     }
                 }
-                thread::sleep(delay);
+                thread::sleep(delay); // احترام به پروفایل سخت‌افزاری کامپیوتر
             }
 
             total_run_configs += channel_configs;
@@ -1058,7 +1095,7 @@ fn run_worker(
 }
 
 // =============================================================
-// توابع کمکی (Helper Functions)
+// توابع کمکی فایل‌ها و پردازش
 // =============================================================
 
 fn extract_error_msg(err: &anyhow::Error) -> String {
