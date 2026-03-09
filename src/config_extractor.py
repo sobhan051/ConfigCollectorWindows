@@ -42,7 +42,7 @@ ch.setFormatter(CustomFormatter())
 logger.addHandler(ch)
 
 def get_repo_context():
-    repo = os.getenv("GITHUB_REPOSITORY", "10ium/VpnClashFaCollector")
+    repo = os.getenv("GITHUB_REPOSITORY", "ConfigCollectorWindows/ConfigCollectorWindows")
     branch = os.getenv("GITHUB_REF_NAME", "main")
     return repo, branch
 
