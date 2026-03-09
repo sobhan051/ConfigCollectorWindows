@@ -137,7 +137,6 @@ impl SentHistory {
         Self::default()
     }
     
-    // تابع مهمی که قبلا جا افتاده بود و باعث ارور E0599 می‌شد
     fn prune(&mut self, lookback_days: i64) {
         let threshold = Utc::now() - ChronoDuration::days(lookback_days.max(1));
         self.sent_at.retain(|_, ts| *ts >= threshold);
@@ -585,7 +584,7 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
             for link in links {
                 if !history.sent_at.contains_key(&link) {
                     history.sent_at.insert(link.clone(), Utc::now());
-                    new_only.entry(proto).or_default().insert(link);
+                    new_only.entry(proto.clone()).or_default().insert(link);
                 }
             }
         }
