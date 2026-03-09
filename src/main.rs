@@ -260,21 +260,29 @@ impl AppState {
     }
 
     fn poll_events(&mut self) {
+        // Collect events first to avoid borrowing `self` mutably and immutably at the same time
+        let mut events = Vec::new();
         if let Some(rx) = &self.event_rx {
             while let Ok(event) = rx.try_recv() {
-                match event {
-                    WorkerEvent::Log(level, msg) => self.add_log(level, msg),
-                    WorkerEvent::Stats { total, by_protocol } => {
-                        self.total_configs = total;
-                        self.by_protocol = by_protocol;
-                    }
-                    WorkerEvent::ProxyAccess { ok, detail } => {
-                        self.proxy_access_ok = Some(ok);
-                        self.proxy_access_status = detail;
-                    }
+                events.push(event);
+            }
+        }
+
+        // Apply events sequentially
+        for event in events {
+            match event {
+                WorkerEvent::Log(level, msg) => self.add_log(level, msg),
+                WorkerEvent::Stats { total, by_protocol } => {
+                    self.total_configs = total;
+                    self.by_protocol = by_protocol;
+                }
+                WorkerEvent::ProxyAccess { ok, detail } => {
+                    self.proxy_access_ok = Some(ok);
+                    self.proxy_access_status = detail;
                 }
             }
         }
+
         if let Some(handle) = self.worker_handle.take() {
             if handle.is_finished() {
                 let _ = handle.join();
@@ -503,7 +511,7 @@ impl eframe::App for AppState {
 }
 
 // -------------------------------------------------------------
-// Core Network & Worker Logic (Completely Redesigned Fallback)
+// Core Network & Worker Logic
 // -------------------------------------------------------------
 
 fn run_worker(
@@ -538,7 +546,7 @@ fn run_worker(
     };
     log_worker(&tx, LogLevel::Info, format!("🚀 Starting worker in mode: {}", mode_str));
 
-    // Probe Telegram domain (not web.telegram.org to avoid web restrictions)
+    // Probe Telegram domain
     let probe_url = "https://t.me/s/telegram";
     match client.get(probe_url).send() {
         Ok(resp) if resp.status().is_success() => {
@@ -635,7 +643,7 @@ fn fetch_channel_configs(
     let mut result: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut before: Option<String> = None;
 
-    for page in 1..=max_pages {
+    for _page in 1..=max_pages {
         let mut url = format!("https://t.me/s/{}", channel);
         if let Some(ref id) = before {
             url.push_str(&format!("?before={}", id));
@@ -699,14 +707,13 @@ fn fetch_channel_configs(
             break;
         }
         before = next_before;
-        thread::sleep(Duration::from_millis(1500)); // Python script used 1.5s delay
+        thread::sleep(Duration::from_millis(1500)); // Safe delay
     }
 
     Ok(result)
 }
 
 fn build_client(config: &AppConfig) -> Result<Client> {
-    // Timeout های طولانی‌تر برای شبکه‌های ایران
     let mut b = ClientBuilder::new()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(15)) 
@@ -717,12 +724,12 @@ fn build_client(config: &AppConfig) -> Result<Client> {
             b = b.no_proxy();
         }
         ProxyType::System => {
-            // به طور پیش‌فرض reqwest از پروکسی سیستم استفاده می‌کند.
+            // reqwest uses system proxy by default
         }
         ProxyType::Http | ProxyType::Socks5 => {
             let scheme = match config.proxy_type {
                 ProxyType::Http => "http",
-                ProxyType::Socks5 => "socks5h", // 'h' = Remote DNS Resolution (Critical for bypass)
+                ProxyType::Socks5 => "socks5h", // 'h' = Remote DNS Resolution
                 _ => unreachable!(),
             };
             
