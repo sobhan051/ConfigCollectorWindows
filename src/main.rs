@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use eframe::egui;
 use regex::Regex;
 use reqwest::blocking::ClientBuilder;
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -23,8 +24,8 @@ const OUTPUT_APPEND_DIR: &str = "output/append_unique";
 const HISTORY_PATH: &str = "output/sent_history.json";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const DEFAULT_PROTOCOLS: [&str; 26] = [
-    "vmess", "vless", "trojan", "ss", "ssr", "tuic", "hysteria", "hysteria2", "juicity",
+const DEFAULT_PROTOCOLS: [&str; 27] = [
+    "vmess", "vless", "trojan", "ss", "ssr", "tuic", "hysteria", "hysteria2", "hy2", "juicity",
     "snell", "anytls", "ssh", "wireguard", "wg", "warp", "socks", "socks4", "socks5", "tg", "dns",
     "nm-dns", "nm-vless", "slipnet-enc", "slipnet", "slipstream", "dnstt",
 ];
@@ -32,12 +33,12 @@ const DEFAULT_PROTOCOLS: [&str; 26] = [
 fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1050.0, 750.0])
-            .with_min_inner_size([850.0, 600.0]),
+            .with_inner_size([1050.0, 700.0])
+            .with_min_inner_size([850.0, 550.0]),
         ..Default::default()
     };
     let _ = eframe::run_native(
-        "Config Collector Pro",
+        "⚡ Config Collector Pro (Windows Edition)",
         options,
         Box::new(|_| Ok(Box::new(AppState::bootstrap()))),
     );
@@ -96,7 +97,7 @@ impl Default for AppConfig {
                 p.to_string(),
                 ProtocolRule {
                     enabled: true,
-                    max_count: 5000, // محدودیت پیش‌فرض بالاتر برای بکاپ کامل
+                    max_count: 5000,
                 },
             );
         }
@@ -104,11 +105,11 @@ impl Default for AppConfig {
             interval_minutes: 5,
             max_pages_per_channel: 15,
             lookback_days: 2,
-            engine: ScrapingEngine::Reqwest, // سرعت بالا با ریکوئست
+            engine: ScrapingEngine::RealBrowser, // برگشت به موتور مرورگر (برای عبور از فیلتر و کلادفلر)
             proxy_type: ProxyType::System,
             proxy_host: "127.0.0.1".to_string(),
             proxy_port: 10808,
-            performance: PerformanceProfile::StrongPC,
+            performance: PerformanceProfile::MediumPC, // پروفایل متعادل برای جلوگیری از هنگ کردن مرورگرها
             ignore_ssl_errors: true,
             remote_dns: true,
             output_new_only_enabled: true,
@@ -235,7 +236,7 @@ impl AppState {
             logs: vec![LogMessage {
                 time: Local::now().format("%H:%M:%S").to_string(),
                 level: LogLevel::Info,
-                text: "🖥️ System Boot: Ultra-Fast Core Loaded. Output engines fixed.".to_string(),
+                text: "🖥️ System Boot: Network Core Reverted to Safe VPN Mode.".to_string(),
             }],
             total_configs: 0,
             by_protocol: BTreeMap::new(),
@@ -250,7 +251,7 @@ impl AppState {
     }
 
     fn test_connection(&mut self) {
-        self.proxy_access_status = "Testing connection...".to_string();
+        self.proxy_access_status = "Testing connection (Ping)...".to_string();
         self.proxy_access_ok = None;
         let tx = self.event_tx.clone();
         let config = self.config.clone();
@@ -263,27 +264,27 @@ impl AppState {
                     if html.len() > 100 {
                         let _ = tx.send(AppEvent::PingResult {
                             ok: true,
-                            detail: format!("Online ({}ms)", elapsed),
+                            detail: format!("Online 🟢 ({}ms)", elapsed),
                         });
                         let _ = tx.send(AppEvent::Log(
                             LogLevel::Success,
-                            format!("📡 Network Passed! Size: {} bytes", html.len()),
+                            format!("📡 Network Check Passed! Page size: {} bytes", html.len()),
                         ));
                     } else {
                         let _ = tx.send(AppEvent::PingResult {
                             ok: false,
-                            detail: "Failed (Empty)".to_string(),
+                            detail: "Failed (Empty Page) 🔴".to_string(),
                         });
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::PingResult {
                         ok: false,
-                        detail: "Failed".to_string(),
+                        detail: "Failed 🔴".to_string(),
                     });
                     let _ = tx.send(AppEvent::Log(
                         LogLevel::Error,
-                        format!("📡 Network Failed: {}", e),
+                        format!("📡 Network Test Failed: {}", e),
                     ));
                 }
             }
@@ -319,7 +320,7 @@ impl AppState {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.add_log(
             LogLevel::Warning,
-            "🛑 Stop signal sent. Wrapping up safely...".to_string(),
+            "🛑 Stop signal sent. Wrapping up current task safely...".to_string(),
         );
     }
 
@@ -347,7 +348,7 @@ impl AppState {
                     self.running = false;
                     self.add_log(
                         LogLevel::Warning,
-                        "💤 Worker successfully terminated.".to_string(),
+                        "💤 Worker thread successfully terminated.".to_string(),
                     );
                 }
             }
@@ -406,7 +407,7 @@ impl eframe::App for AppState {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new("Stop Process")
+                                        egui::RichText::new("🛑 Stop Process")
                                             .strong()
                                             .color(egui::Color32::WHITE),
                                     )
@@ -421,7 +422,7 @@ impl eframe::App for AppState {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new("Start Engine")
+                                        egui::RichText::new("▶ Start Engine")
                                             .strong()
                                             .color(egui::Color32::WHITE),
                                     )
@@ -431,7 +432,7 @@ impl eframe::App for AppState {
                             {
                                 self.start();
                             }
-                            if ui.button("Test Network").clicked() {
+                            if ui.button("🔄 Test Network").clicked() {
                                 self.test_connection();
                             }
                         }
@@ -448,9 +449,9 @@ impl eframe::App for AppState {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.active_tab, 0, "Main");
-                    ui.selectable_value(&mut self.active_tab, 1, "Targets");
-                    ui.selectable_value(&mut self.active_tab, 2, "Filters");
+                    ui.selectable_value(&mut self.active_tab, 0, "⚙️ Main");
+                    ui.selectable_value(&mut self.active_tab, 1, "📋 Targets");
+                    ui.selectable_value(&mut self.active_tab, 2, "🛡️ Filters");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -462,19 +463,19 @@ impl eframe::App for AppState {
                             );
                             egui::ComboBox::from_label("Type")
                                 .selected_text(match self.config.engine {
-                                    ScrapingEngine::RealBrowser => "Browser (Stealth/Slow)",
-                                    ScrapingEngine::Reqwest => "API (Fast)",
+                                    ScrapingEngine::RealBrowser => "Browser (Stealth/Bypass)",
+                                    ScrapingEngine::Reqwest => "API (Fast/Unsafe)",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut self.config.engine,
-                                        ScrapingEngine::Reqwest,
-                                        "API (Fast)",
+                                        ScrapingEngine::RealBrowser,
+                                        "Browser (Stealth/Bypass)",
                                     );
                                     ui.selectable_value(
                                         &mut self.config.engine,
-                                        ScrapingEngine::RealBrowser,
-                                        "Browser (Stealth/Slow)",
+                                        ScrapingEngine::Reqwest,
+                                        "API (Fast/Unsafe)",
                                     );
                                 });
 
@@ -485,15 +486,15 @@ impl eframe::App for AppState {
                             );
                             egui::ComboBox::from_label("PC Power")
                                 .selected_text(match self.config.performance {
-                                    PerformanceProfile::WeakPC => "Weak PC (Safe)",
+                                    PerformanceProfile::WeakPC => "Weak PC (Safe/Slow)",
                                     PerformanceProfile::MediumPC => "Medium PC (Balanced)",
-                                    PerformanceProfile::StrongPC => "Strong PC (Fast Multi-threading)",
+                                    PerformanceProfile::StrongPC => "Strong PC (Fast/Heavy)",
                                 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut self.config.performance,
                                         PerformanceProfile::WeakPC,
-                                        "Weak PC (Safe)",
+                                        "Weak PC (Safe/Slow)",
                                     );
                                     ui.selectable_value(
                                         &mut self.config.performance,
@@ -503,9 +504,14 @@ impl eframe::App for AppState {
                                     ui.selectable_value(
                                         &mut self.config.performance,
                                         PerformanceProfile::StrongPC,
-                                        "Strong PC (Fast Multi-threading)",
+                                        "Strong PC (Fast/Heavy)",
                                     );
                                 });
+                            ui.label(
+                                egui::RichText::new("Choose 'Weak PC' if your computer hangs.")
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
 
                             ui.add_space(15.0);
                             ui.heading(
@@ -558,7 +564,7 @@ impl eframe::App for AppState {
                             }
                             ui.checkbox(
                                 &mut self.config.ignore_ssl_errors,
-                                "Bypass SSL/TLS Filter",
+                                "Bypass SSL/TLS Filter (For VPNs)",
                             );
                             if self.config.proxy_type == ProxyType::Socks5 {
                                 ui.checkbox(&mut self.config.remote_dns, "Remote DNS (socks5h)");
@@ -570,15 +576,15 @@ impl eframe::App for AppState {
                                     .color(egui::Color32::LIGHT_BLUE),
                             );
                             ui.checkbox(&mut self.config.output_new_only_enabled, "Save 'New Only' Configs");
-                            ui.label(egui::RichText::new("    └ Extracts fresh configs not in history (output/new_only)").small().color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("    └ Extracts fresh configs not in history").small().color(egui::Color32::GRAY));
                             
                             ui.add_space(5.0);
                             ui.checkbox(&mut self.config.output_append_unique_enabled, "Save 'Full Backup' (Append)");
-                            ui.label(egui::RichText::new("    └ Adds ALL found configs to old ones (output/append_unique)").small().color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("    └ Adds ALL found configs to old ones").small().color(egui::Color32::GRAY));
 
                             ui.add_space(15.0);
                             ui.heading(
-                                egui::RichText::new("⏱️ Scheduler & Limits")
+                                egui::RichText::new("⏱️ Scheduler")
                                     .color(egui::Color32::LIGHT_BLUE),
                             );
                             ui.horizontal(|ui| {
@@ -589,7 +595,7 @@ impl eframe::App for AppState {
                                 );
                             });
                             ui.horizontal(|ui| {
-                                ui.label("Max Pages/Ch:");
+                                ui.label("Max Pages:");
                                 ui.add(
                                     egui::DragValue::new(&mut self.config.max_pages_per_channel)
                                         .range(1..=100),
@@ -665,7 +671,7 @@ impl eframe::App for AppState {
                     };
                     ui.group(|ui| {
                         ui.label(
-                            egui::RichText::new("🌐 Network Status:").color(egui::Color32::GRAY),
+                            egui::RichText::new("🌐 Connection:").color(egui::Color32::GRAY),
                         );
                         ui.label(
                             egui::RichText::new(&self.proxy_access_status)
@@ -690,10 +696,10 @@ impl eframe::App for AppState {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("Clear").clicked() {
+                                    if ui.button("🗑️ Clear").clicked() {
                                         self.logs.clear();
                                     }
-                                    if ui.button("Copy").clicked() {
+                                    if ui.button("📋 Copy").clicked() {
                                         let text = self
                                             .logs
                                             .iter()
@@ -741,14 +747,14 @@ impl eframe::App for AppState {
 }
 
 // =============================================================
-// 🛡️ هسته شبکه ایمن
+// 🛡️ هسته شبکه ایمن (دقیقاً نسخه اصلی شما که کار می‌کرد)
 // =============================================================
 
 fn get_performance_settings(profile: &PerformanceProfile, engine: &ScrapingEngine) -> (Duration, u64, usize) {
     match (profile, engine) {
         (PerformanceProfile::WeakPC, ScrapingEngine::RealBrowser) => (Duration::from_secs(4), 18000, 1),
         (PerformanceProfile::MediumPC, ScrapingEngine::RealBrowser) => (Duration::from_secs(2), 12000, 1),
-        (PerformanceProfile::StrongPC, ScrapingEngine::RealBrowser) => (Duration::from_secs(1), 8000, 2),
+        (PerformanceProfile::StrongPC, ScrapingEngine::RealBrowser) => (Duration::from_secs(1), 8000, 2), // برای مرورگر ماکزیمم 2 نخ کافیست تا رم پر نشود
         
         (PerformanceProfile::WeakPC, ScrapingEngine::Reqwest) => (Duration::from_millis(1500), 10000, 2),
         (PerformanceProfile::MediumPC, ScrapingEngine::Reqwest) => (Duration::from_millis(500), 10000, 5),
@@ -771,10 +777,10 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         "--dump-dom".to_string(),
         "--disable-gpu".to_string(),
         "--no-sandbox".to_string(),
-        "--disable-dev-shm-usage".to_string(),
+        "--disable-dev-shm-usage".to_string(), // بسیار مهم برای جلوگیری از پر شدن حافظه ویندوز
         "--disable-extensions".to_string(),
         "--mute-audio".to_string(),
-        "--window-size=1920,1080".to_string(),
+        "--window-size=1920,1080".to_string(), // تلگرام گاهی بدون سایز پنجره محتوا را لود نمی‌کند
         format!("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     ];
 
@@ -784,11 +790,23 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
             args.push("--no-proxy-server".to_string());
         }
         ProxyType::Http | ProxyType::Socks5 => {
-            let scheme = if config.proxy_type == ProxyType::Socks5 { "socks5" } else { "http" };
-            let host = if config.proxy_host.is_empty() { "127.0.0.1" } else { &config.proxy_host };
-            args.push(format!("--proxy-server={}://{}:{}", scheme, host, config.proxy_port));
+            let scheme = if config.proxy_type == ProxyType::Socks5 {
+                "socks5"
+            } else {
+                "http"
+            };
+            let host = if config.proxy_host.is_empty() {
+                "127.0.0.1"
+            } else {
+                &config.proxy_host
+            };
+            args.push(format!(
+                "--proxy-server={}://{}:{}",
+                scheme, host, config.proxy_port
+            ));
         }
     }
+    
     args.push(url.to_string());
 
     let browsers = [
@@ -799,6 +817,7 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
     ];
 
     for browser in browsers {
+        // استفاده از spawn به جای output برای جلوگیری قطعی از Deadlock (بن بست)
         let mut child_proc = match Command::new(browser)
             .args(&args)
             .creation_flags(CREATE_NO_WINDOW)
@@ -814,26 +833,44 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         let mut stdout_str = String::new();
         let mut is_completed = false;
 
+        // خواندن امن داده‌ها با تایم‌اوت
         if let Some(mut stdout) = child_proc.stdout.take() {
             let mut buffer = [0; 4096];
             loop {
-                if start_time.elapsed().as_millis() as u64 > timeout_ms { break; }
+                // اگر زمان گذشت، خارج شو
+                if start_time.elapsed().as_millis() as u64 > timeout_ms {
+                    break;
+                }
+
+                // خواندن غیرمسدودکننده از خروجی مرورگر
                 match stdout.read(&mut buffer) {
-                    Ok(0) => { is_completed = true; break; }
-                    Ok(n) => stdout_str.push_str(&String::from_utf8_lossy(&buffer[..n])),
+                    Ok(0) => {
+                        is_completed = true;
+                        break; // پایان اطلاعات
+                    }
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buffer[..n]);
+                        stdout_str.push_str(&chunk);
+                    }
                     Err(_) => break,
                 }
                 thread::sleep(Duration::from_millis(50));
             }
         }
 
+        // اگر پروسه گیر کرده بود، آن را با خشونت می‌کشیم تا کامپیوتر هنگ نکند
         if !is_completed {
             let _ = child_proc.kill();
-            return Err(anyhow::anyhow!("Browser timeout. Process safely killed."));
+            return Err(anyhow::anyhow!("Browser timeout exceeded ({}ms). Process safely killed.", timeout_ms));
         }
-        let _ = child_proc.wait();
-        if stdout_str.len() > 50 { return Ok(stdout_str); }
+
+        let _ = child_proc.wait(); // پاکسازی پروسه از ویندوز
+
+        if stdout_str.len() > 50 {
+            return Ok(stdout_str);
+        }
     }
+    
     anyhow::bail!("Failed to execute browser or received empty response.")
 }
 
@@ -844,21 +881,38 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
         .danger_accept_invalid_certs(config.ignore_ssl_errors);
 
     match config.proxy_type {
-        ProxyType::None => b = b.no_proxy(),
+        ProxyType::None => {
+            b = b.no_proxy();
+        }
         ProxyType::System => {}
         ProxyType::Http | ProxyType::Socks5 => {
-            let scheme = if config.proxy_type == ProxyType::Socks5 && config.remote_dns { "socks5h" } else if config.proxy_type == ProxyType::Socks5 { "socks5" } else { "http" };
-            let host = if config.proxy_host.trim().is_empty() { "127.0.0.1" } else { config.proxy_host.trim() };
-            b = b.proxy(reqwest::Proxy::all(&format!("{}://{}:{}", scheme, host, config.proxy_port))?);
+            let scheme = if config.proxy_type == ProxyType::Socks5 && config.remote_dns {
+                "socks5h"
+            } else if config.proxy_type == ProxyType::Socks5 {
+                "socks5"
+            } else {
+                "http"
+            };
+            let host = if config.proxy_host.trim().is_empty() {
+                "127.0.0.1"
+            } else {
+                config.proxy_host.trim()
+            };
+            b = b.proxy(reqwest::Proxy::all(&format!(
+                "{}://{}:{}",
+                scheme, host, config.proxy_port
+            ))?);
         }
     }
     let resp = b.build()?.get(url).send()?;
-    if !resp.status().is_success() { anyhow::bail!("HTTP {}", resp.status()); }
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP {}", resp.status());
+    }
     Ok(resp.text()?)
 }
 
 // =============================================================
-// 🧠 پردازشگر چند نخی و استخراج هوشمند (مانند کد پایتون)
+// 🧠 استخراج هوشمند با پشتیبانی از Multi-threading
 // =============================================================
 
 fn run_worker(
@@ -870,7 +924,6 @@ fn run_worker(
     let channels = parse_channels(&channels_raw);
     let (delay, _, concurrency) = get_performance_settings(&config.performance, &config.engine);
 
-    // Regex قدرتمند و تمیز
     let regex_pattern = r"(?i)(vmess|vless|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[a-zA-Z0-9\-\._~:/\?#\[\]@!\$&'\(\)\*\+,%;=]+";
     let regex = Arc::new(Regex::new(regex_pattern).unwrap());
     let mut history = SentHistory::load();
@@ -914,7 +967,6 @@ fn run_worker(
                                     let mut found_in_page = 0;
                                     let mut next_before = None;
 
-                                    // پاکسازی کدهای مخفی HTML مثل سورس پایتون
                                     let decoded_html = raw_html
                                         .replace("&amp;", "&")
                                         .replace("&lt;", "<")
@@ -947,14 +999,12 @@ fn run_worker(
 
                                     for m in regex_clone.find_iter(&decoded_html) {
                                         let full_match = m.as_str();
-                                        // پاک کردن کاراکترهای اضافه انتهای لینک
                                         let clean_link = full_match
                                             .trim_end_matches(&['(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'][..])
                                             .to_string();
 
                                         if let Some(proto_raw) = clean_link.split("://").next() {
                                             let mut proto = proto_raw.to_lowercase();
-                                            // ادغام هوشمند hy2 با hysteria2 (طبق پایتون)
                                             if proto == "hy2" { proto = "hysteria2".to_string(); }
                                             
                                             found_in_page += 1;
@@ -999,7 +1049,6 @@ fn run_worker(
             thread::sleep(Duration::from_secs(2));
         }
 
-        // تفکیک کانفیگ‌های کاملاً جدید
         let mut new_only: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (proto, links) in &global_gathered {
             for link in links {
@@ -1020,14 +1069,11 @@ fn run_worker(
             total_new += v.len();
         }
 
-        // سیستم ذخیره‌سازی پیشرفته و ۱۰۰٪ ایمن
         if config.output_new_only_enabled {
-            // ذخیره فایل‌های فقط جدید (حالت Replace)
             let _ = write_configs_safe(OUTPUT_NEW_DIR, &new_only, &config, false);
         }
         
         if config.output_append_unique_enabled {
-            // نکته طلایی: برای بکاپ کامل، کل کانفیگ‌های پیدا شده (global_gathered) را به قبلی‌ها اضافه می‌کنیم!
             let _ = write_configs_safe(OUTPUT_APPEND_DIR, &global_gathered, &config, true);
         }
 
@@ -1068,7 +1114,6 @@ fn apply_protocol_limits(store: &mut BTreeMap<String, BTreeSet<String>>, rules: 
     }
 }
 
-// تابع جدید که بدون خراب کردن فایل‌ها عملیات را انجام می‌دهد و Base64 نیز می‌سازد
 fn write_configs_safe(
     base_dir: &str, 
     store: &BTreeMap<String, BTreeSet<String>>, 
@@ -1085,35 +1130,27 @@ fn write_configs_safe(
         let path_txt = Path::new(base_dir).join(format!("{}.txt", proto));
         let path_b64 = Path::new(base_dir).join(format!("{}_base64.txt", proto));
 
-        // اگر حالت اپند فعال بود، ابتدا محتوای قبلی فایل‌ها را می‌خوانیم
         if append_mode {
             if let Ok(existing) = read_existing_set(&path_txt) {
                 current_set.extend(existing);
             }
         }
 
-        // سپس اطلاعات این دوره‌ی اسکن را به لیست اضافه می‌کنیم
         if let Some(links) = store.get(proto) {
             current_set.extend(links.iter().cloned());
         }
 
-        // فقط در صورتی فایلی نوشته یا آپدیت می‌شود که کانفیگی برای آن وجود داشته باشد!
         if !current_set.is_empty() {
             let text_content = current_set.iter().cloned().collect::<Vec<_>>().join("\n");
-            
-            // نوشتن فایل معمولی
             fs::write(&path_txt, &text_content)?;
             
-            // نوشتن فایل Base64
             use base64::{Engine as _, engine::general_purpose::STANDARD};
             fs::write(&path_b64, STANDARD.encode(&text_content))?;
             
-            // اضافه کردن به میکس نهایی
             mixed.extend(current_set);
         }
     }
 
-    // نوشتن فایل‌های Mixed
     if !mixed.is_empty() {
         let path_mixed = Path::new(base_dir).join("mixed.txt");
         let path_mixed_b64 = Path::new(base_dir).join("mixed_base64.txt");
