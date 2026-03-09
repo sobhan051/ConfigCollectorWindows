@@ -859,42 +859,44 @@ fn channel_page_urls(channel: &str, before: Option<&str>) -> Vec<String> {
 
 fn build_client(config: &AppConfig) -> Result<Client> {
     let mut b = ClientBuilder::new()
-        .timeout(Duration::from_secs(25))
-        .user_agent("Mozilla/5.0 ConfigCollectorWindows/1.1");
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(10)) // جلوگیری از هنگ طولانی روی اتصال اولیه
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"); // مرورگر استاندارد برای جلوگیری از محدودیت‌های کلادفلر
 
     match config.proxy_type {
         ProxyType::None => {
             b = b.no_proxy();
         }
-        ProxyType::System => {}
+        ProxyType::System => {
+            // reqwest به طور خودکار تنظیمات سیستم را اعمال می‌کند. 
+            // در ویندوز ممکن است نیاز به متغیرهای محیطی HTTP_PROXY باشد.
+        }
         ProxyType::Http | ProxyType::Socks5 => {
             if config.proxy_host.trim().is_empty() {
                 anyhow::bail!("Proxy host is required for HTTP/SOCKS5 proxy mode");
             }
-            b = b.no_proxy();
+            b = b.no_proxy(); // خاموش کردن پروکسی‌های پیش‌فرض تا تداخل ایجاد نکنند
             let scheme = match config.proxy_type {
                 ProxyType::Http => "http",
-                ProxyType::Socks5 => "socks5h",
-                ProxyType::None | ProxyType::System => unreachable!(),
+                ProxyType::Socks5 => "socks5h", // استفاده از socks5h بسیار مهم است (DNS Resolve سمت پروکسی)
+                _ => unreachable!(),
             };
-            let proxy = if config.proxy_username.trim().is_empty() {
-                format!(
-                    "{scheme}://{}:{}",
-                    config.proxy_host.trim(),
-                    config.proxy_port
-                )
+            
+            let proxy_url = if config.proxy_username.trim().is_empty() {
+                format!("{}://{}:{}", scheme, config.proxy_host.trim(), config.proxy_port)
             } else {
                 format!(
-                    "{scheme}://{}:{}@{}:{}",
-                    url::form_urlencoded::byte_serialize(config.proxy_username.as_bytes())
-                        .collect::<String>(),
-                    url::form_urlencoded::byte_serialize(config.proxy_password.as_bytes())
-                        .collect::<String>(),
+                    "{}://{}:{}@{}:{}",
+                    scheme,
+                    url::form_urlencoded::byte_serialize(config.proxy_username.as_bytes()).collect::<String>(),
+                    url::form_urlencoded::byte_serialize(config.proxy_password.as_bytes()).collect::<String>(),
                     config.proxy_host.trim(),
                     config.proxy_port
                 )
             };
-            b = b.proxy(reqwest::Proxy::all(&proxy)?);
+            
+            let proxy = reqwest::Proxy::all(&proxy_url)?;
+            b = b.proxy(proxy);
         }
     }
 
@@ -902,19 +904,20 @@ fn build_client(config: &AppConfig) -> Result<Client> {
 }
 
 fn build_fallback_client(config: &AppConfig) -> Result<Option<Client>> {
-    let fallback_builder = || {
-        ClientBuilder::new()
-            .timeout(Duration::from_secs(25))
-            .user_agent("Mozilla/5.0 ConfigCollectorWindows/1.1")
-    };
-
-    let fallback = match config.proxy_type {
-        ProxyType::None => Some(fallback_builder().build()?),
-        ProxyType::System => Some(fallback_builder().no_proxy().build()?),
-        ProxyType::Http | ProxyType::Socks5 => Some(fallback_builder().no_proxy().build()?),
-    };
-
-    Ok(fallback)
+    // اگر کاربر به صورت صریح پروکسی HTTP یا SOCKS5 تنظیم کرده است، هرگز نباید از 
+    // اتصال بدون پروکسی (Direct) به عنوان پشتیبان استفاده کنیم، چون در ایران منجر به Timeout قطعی می‌شود.
+    match config.proxy_type {
+        ProxyType::Http | ProxyType::Socks5 => Ok(None),
+        _ => {
+            let fallback = ClientBuilder::new()
+                .timeout(Duration::from_secs(20))
+                .connect_timeout(Duration::from_secs(10))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .no_proxy()
+                .build()?;
+            Ok(Some(fallback))
+        }
+    }
 }
 
 fn send_request_with_fallback(
