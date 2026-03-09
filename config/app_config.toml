@@ -1,0 +1,24 @@
+interval_minutes = 5
+max_pages_per_channel = 8
+lookback_days = 1
+proxy_type = "None"
+proxy_host = ""
+proxy_port = 1080
+proxy_username = ""
+proxy_password = ""
+
+[protocol_rules.vmess]
+enabled = true
+max_count = 500
+
+[protocol_rules.vless]
+enabled = true
+max_count = 500
+
+[protocol_rules.trojan]
+enabled = true
+max_count = 500
+
+[protocol_rules.ss]
+enabled = true
+max_count = 500
