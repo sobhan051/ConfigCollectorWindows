@@ -6,8 +6,7 @@ edition = "2021"
 [dependencies]
 eframe = { version = "0.29", default-features = true }
 egui = "0.29"
-# ویژگی charset اضافه شد تا resp.text() به درستی صفحات غیر utf-8 را پردازش کند
-reqwest = { version = "0.12", features = ["blocking", "socks", "gzip", "brotli", "deflate", "charset"] }
+reqwest = { version = "0.12", default-features = true, features = ["blocking", "socks", "gzip", "brotli", "deflate", "charset"] }
 scraper = "0.20"
 regex = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
@@ -17,9 +16,8 @@ anyhow = "1.0"
 url = "2.5"
 serde_json = "1.0"
 
-# پروفایل بیلد نهایی: بهینه‌سازی شده برای ویندوز جهت کاهش شدید حجم فایل اجرایی و افزایش سرعت
 [profile.release]
-opt-level = 3       # حداکثر بهینه‌سازی سرعت
-lto = true          # بهینه‌سازی Link Time (افزایش سرعت، کاهش سایز)
-codegen-units = 1   # پردازش یکپارچه کد برای بهینه‌سازی بهتر (بیلد کمی طولانی‌تر می‌شود اما خروجی بهتر است)
-strip = true        # حذف سیمبول‌های دیباگ (حجم فایل exe را تا 70% کاهش می‌دهد)
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
