@@ -22,3 +22,95 @@ max_count = 500
 [protocol_rules.ss]
 enabled = true
 max_count = 500
+
+[protocol_rules.ssr]
+enabled = true
+max_count = 500
+
+[protocol_rules.tuic]
+enabled = true
+max_count = 500
+
+[protocol_rules.hysteria]
+enabled = true
+max_count = 500
+
+[protocol_rules.hysteria2]
+enabled = true
+max_count = 500
+
+[protocol_rules.hy2]
+enabled = true
+max_count = 500
+
+[protocol_rules.juicity]
+enabled = true
+max_count = 500
+
+[protocol_rules.snell]
+enabled = true
+max_count = 500
+
+[protocol_rules.anytls]
+enabled = true
+max_count = 500
+
+[protocol_rules.ssh]
+enabled = true
+max_count = 500
+
+[protocol_rules.wireguard]
+enabled = true
+max_count = 500
+
+[protocol_rules.wg]
+enabled = true
+max_count = 500
+
+[protocol_rules.warp]
+enabled = true
+max_count = 500
+
+[protocol_rules.socks]
+enabled = true
+max_count = 500
+
+[protocol_rules.socks4]
+enabled = true
+max_count = 500
+
+[protocol_rules.socks5]
+enabled = true
+max_count = 500
+
+[protocol_rules.tg]
+enabled = true
+max_count = 500
+
+[protocol_rules.dns]
+enabled = true
+max_count = 500
+
+[protocol_rules.nm-dns]
+enabled = true
+max_count = 500
+
+[protocol_rules.nm-vless]
+enabled = true
+max_count = 500
+
+[protocol_rules.slipnet-enc]
+enabled = true
+max_count = 500
+
+[protocol_rules.slipnet]
+enabled = true
+max_count = 500
+
+[protocol_rules.slipstream]
+enabled = true
+max_count = 500
+
+[protocol_rules.dnstt]
+enabled = true
+max_count = 500
