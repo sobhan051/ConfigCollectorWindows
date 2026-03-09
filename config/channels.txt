@@ -1,3 +1,3 @@
-# یک کانال در هر خط
+# one channel per line
 # @channel_name
 # https://t.me/channel_name

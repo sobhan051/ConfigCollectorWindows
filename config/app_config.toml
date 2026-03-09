@@ -1,12 +1,13 @@
 interval_minutes = 5
 max_pages_per_channel = 8
 lookback_days = 1
-language = "Fa"
 proxy_type = "None"
 proxy_host = ""
 proxy_port = 1080
 proxy_username = ""
 proxy_password = ""
+output_new_only_enabled = true
+output_append_unique_enabled = false
 
 [protocol_rules.vmess]
 enabled = true
