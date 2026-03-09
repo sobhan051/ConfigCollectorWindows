@@ -7,7 +7,7 @@ edition = "2021"
 eframe = { version = "0.29", default-features = true }
 egui = "0.29"
 # ویژگی charset اضافه شد تا resp.text() به درستی صفحات غیر utf-8 را پردازش کند
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "socks", "gzip", "brotli", "deflate", "charset"] }
+reqwest = { version = "0.12", features = ["blocking", "socks", "gzip", "brotli", "deflate", "charset"] }
 scraper = "0.20"
 regex = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
