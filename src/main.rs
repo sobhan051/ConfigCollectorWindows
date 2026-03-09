@@ -265,145 +265,207 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.heading("🛰️ Telegram Config Collector");
+        let mut visuals = egui::Visuals::dark();
+        visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+        visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
+        visuals.widgets.active.rounding = egui::Rounding::same(8.0);
+        visuals.override_text_color = Some(egui::Color32::from_rgb(230, 233, 238));
+        visuals.selection.bg_fill = egui::Color32::from_rgb(57, 119, 255);
+        visuals.panel_fill = egui::Color32::from_rgb(18, 20, 26);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(12, 13, 18);
+        ctx.set_visuals(visuals);
+
+        ctx.style_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            style.spacing.button_padding = egui::vec2(10.0, 6.0);
+            style.spacing.indent = 14.0;
         });
 
-        egui::SidePanel::left("left")
-            .min_width(360.0)
+        egui::TopBottomPanel::top("header")
+            .exact_height(68.0)
             .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                    ui.heading("Main Settings");
-                    ui.horizontal(|ui| {
-                        ui.label("Check interval (minutes):");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.interval_minutes).range(1..=240),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Max pages per channel:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.max_pages_per_channel)
-                                .range(1..=100),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Look back days:");
-                        ui.add(egui::DragValue::new(&mut self.config.lookback_days).range(1..=30));
-                    });
-
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.heading("🛰️ Telegram Config Collector");
                     ui.separator();
-                    ui.heading("Proxy");
-                    egui::ComboBox::from_label("Type")
-                        .selected_text(match self.config.proxy_type {
-                            ProxyType::None => "No proxy",
-                            ProxyType::System => "System proxy",
-                            ProxyType::Http => "HTTP",
-                            ProxyType::Socks5 => "SOCKS5",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.config.proxy_type,
-                                ProxyType::None,
-                                "No proxy",
-                            );
-                            ui.selectable_value(
-                                &mut self.config.proxy_type,
-                                ProxyType::System,
-                                "System proxy",
-                            );
-                            ui.selectable_value(
-                                &mut self.config.proxy_type,
-                                ProxyType::Http,
-                                "HTTP",
-                            );
-                            ui.selectable_value(
-                                &mut self.config.proxy_type,
-                                ProxyType::Socks5,
-                                "SOCKS5",
-                            );
-                        });
-                    let custom_proxy =
-                        matches!(self.config.proxy_type, ProxyType::Http | ProxyType::Socks5);
-                    if custom_proxy {
-                        ui.label("Proxy host");
-                        ui.text_edit_singleline(&mut self.config.proxy_host);
-                        ui.horizontal(|ui| {
-                            ui.label("Port");
-                            ui.add(
-                                egui::DragValue::new(&mut self.config.proxy_port).range(1..=65535),
-                            );
-                        });
-                        ui.label("Username (optional)");
-                        ui.text_edit_singleline(&mut self.config.proxy_username);
-                        ui.label("Password (optional)");
-                        ui.text_edit_singleline(&mut self.config.proxy_password);
-                    }
-
-                    ui.separator();
-                    ui.heading("Output modes");
-                    ui.checkbox(
-                        &mut self.config.output_new_only_enabled,
-                        "Replace with new-only output (output/new_only)",
-                    );
-                    ui.checkbox(
-                        &mut self.config.output_append_unique_enabled,
-                        "Append unique output (output/append_unique)",
+                    ui.label(
+                        egui::RichText::new(format!("Total new: {}", self.total_configs)).strong(),
                     );
 
-                    ui.separator();
-                    ui.heading("Protocols (Enable/Disable + Limit)");
-                    for (name, rule) in &mut self.config.protocol_rules {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut rule.enabled, name);
-                            ui.label("Max:");
-                            ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000));
-                        });
+                    if !self.running {
+                        if ui
+                            .add(
+                                egui::Button::new("▶ Start Collection")
+                                    .fill(egui::Color32::from_rgb(36, 116, 242)),
+                            )
+                            .clicked()
+                        {
+                            self.start();
+                        }
+                    } else if ui
+                        .add(egui::Button::new("⏹ Stop").fill(egui::Color32::from_rgb(170, 54, 54)))
+                        .clicked()
+                    {
+                        self.stop();
                     }
 
-                    ui.separator();
-                    if ui.button("💾 Save channels & settings").clicked() {
+                    if ui.button("💾 Save Settings").clicked() {
                         match save_channels(&self.channels_text).and_then(|_| self.config.save()) {
                             Ok(_) => self.logs.push("Settings saved.".to_string()),
                             Err(e) => self.logs.push(format!("Save failed: {e:#}")),
                         }
                     }
-                    if !self.running {
-                        if ui.button("▶️ Start").clicked() {
-                            self.start();
-                        }
-                    } else if ui.button("⏹ Stop").clicked() {
-                        self.stop();
-                    }
+                });
+            });
 
+        egui::SidePanel::left("settings_panel")
+            .resizable(true)
+            .default_width(370.0)
+            .min_width(320.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.group(|ui| {
+                        ui.heading("Main Settings");
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Check interval (minutes)");
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.interval_minutes)
+                                    .range(1..=240),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Max pages per channel");
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.max_pages_per_channel)
+                                    .range(1..=100),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Look back days");
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.lookback_days).range(1..=30),
+                            );
+                        });
+                    });
+
+                    ui.add_space(10.0);
+                    ui.group(|ui| {
+                        ui.heading("Proxy");
+                        ui.separator();
+                        egui::ComboBox::from_label("Type")
+                            .selected_text(match self.config.proxy_type {
+                                ProxyType::None => "No proxy",
+                                ProxyType::System => "System proxy",
+                                ProxyType::Http => "HTTP",
+                                ProxyType::Socks5 => "SOCKS5",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.config.proxy_type,
+                                    ProxyType::None,
+                                    "No proxy",
+                                );
+                                ui.selectable_value(
+                                    &mut self.config.proxy_type,
+                                    ProxyType::System,
+                                    "System proxy",
+                                );
+                                ui.selectable_value(
+                                    &mut self.config.proxy_type,
+                                    ProxyType::Http,
+                                    "HTTP",
+                                );
+                                ui.selectable_value(
+                                    &mut self.config.proxy_type,
+                                    ProxyType::Socks5,
+                                    "SOCKS5",
+                                );
+                            });
+
+                        if matches!(self.config.proxy_type, ProxyType::Http | ProxyType::Socks5) {
+                            ui.label("Proxy host");
+                            ui.text_edit_singleline(&mut self.config.proxy_host);
+                            ui.horizontal(|ui| {
+                                ui.label("Port");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.config.proxy_port)
+                                        .range(1..=65535),
+                                );
+                            });
+                            ui.label("Username (optional)");
+                            ui.text_edit_singleline(&mut self.config.proxy_username);
+                            ui.label("Password (optional)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.proxy_password)
+                                    .password(true),
+                            );
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.group(|ui| {
+                        ui.heading("Output Modes");
+                        ui.separator();
+                        ui.checkbox(
+                            &mut self.config.output_new_only_enabled,
+                            "Replace with new-only output (output/new_only)",
+                        );
+                        ui.checkbox(
+                            &mut self.config.output_append_unique_enabled,
+                            "Append unique output (output/append_unique)",
+                        );
+                    });
+
+                    ui.add_space(10.0);
+                    ui.group(|ui| {
+                        ui.heading("Protocols (Enable/Disable + Limit)");
+                        ui.separator();
+                        for (name, rule) in &mut self.config.protocol_rules {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut rule.enabled, name);
+                                ui.add_space(4.0);
+                                ui.label("Max");
+                                ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000));
+                            });
+                        }
+                    });
+                });
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.columns(2, |columns| {
+                columns[0].group(|ui| {
+                    ui.heading("Channels");
+                    ui.label("One channel per line (@channel or https://t.me/channel)");
+                    ui.add_space(4.0);
+                    ui.add_sized(
+                        [ui.available_width(), ui.available_height() - 12.0],
+                        egui::TextEdit::multiline(&mut self.channels_text),
+                    );
+                });
+
+                columns[1].group(|ui| {
+                    ui.heading("Live Logs");
                     ui.separator();
-                    ui.label(format!("Total new: {}", self.total_configs));
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in self.logs.iter().rev().take(400).rev() {
+                                ui.label(line);
+                            }
+                        });
+                    ui.separator();
+                    ui.heading("By protocol");
                     for (k, v) in &self.by_protocol {
                         ui.label(format!("{k}: {v}"));
                     }
                 });
             });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                ui.heading("Channels list (one per line)");
-                ui.add_sized(
-                    [ui.available_width(), 180.0],
-                    egui::TextEdit::multiline(&mut self.channels_text),
-                );
-                ui.separator();
-                ui.heading("Professional logs");
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in self.logs.iter().rev().take(300).rev() {
-                            ui.label(line);
-                        }
-                    });
-            });
         });
 
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ctx.request_repaint_after(Duration::from_millis(200));
     }
 }
 
