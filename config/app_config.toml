@@ -1,6 +1,7 @@
 interval_minutes = 5
 max_pages_per_channel = 8
 lookback_days = 1
+language = "Fa"
 proxy_type = "None"
 proxy_host = ""
 proxy_port = 1080
