@@ -6,6 +6,7 @@ use reqwest::blocking::{Client, ClientBuilder};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,12 +178,18 @@ enum WorkerEvent {
         total: usize,
         by_protocol: BTreeMap<String, usize>,
     },
+    ProxyAccess {
+        ok: bool,
+        detail: String,
+    },
 }
 
 struct AppState {
     config: AppConfig,
     channels_text: String,
     show_channels_editor: bool,
+    proxy_access_status: String,
+    proxy_access_ok: Option<bool>,
     logs: Vec<String>,
     total_configs: usize,
     by_protocol: BTreeMap<String, usize>,
@@ -200,6 +207,8 @@ impl AppState {
                 "# one channel per line\n# @channel\n# https://t.me/channel".to_string()
             }),
             show_channels_editor: true,
+            proxy_access_status: "Proxy access: not checked yet".to_string(),
+            proxy_access_ok: None,
             logs: vec!["Application is ready.".to_string()],
             total_configs: 0,
             by_protocol: BTreeMap::new(),
@@ -249,6 +258,10 @@ impl AppState {
                         self.total_configs = total;
                         self.by_protocol = by_protocol;
                     }
+                    WorkerEvent::ProxyAccess { ok, detail } => {
+                        self.proxy_access_ok = Some(ok);
+                        self.proxy_access_status = detail;
+                    }
                 }
             }
         }
@@ -294,6 +307,13 @@ impl eframe::App for AppState {
                     ui.label(
                         egui::RichText::new(format!("Total new: {}", self.total_configs)).strong(),
                     );
+                    ui.separator();
+                    let proxy_color = match self.proxy_access_ok {
+                        Some(true) => egui::Color32::from_rgb(90, 200, 120),
+                        Some(false) => egui::Color32::from_rgb(232, 92, 92),
+                        None => egui::Color32::from_rgb(180, 180, 180),
+                    };
+                    ui.label(egui::RichText::new(&self.proxy_access_status).color(proxy_color));
 
                     if !self.running {
                         if ui
@@ -529,6 +549,31 @@ fn run_worker(
             }
         ),
     );
+
+    let proxy_probe_url = "https://web.telegram.org/a/";
+    match check_proxy_access(&client, fallback_client.as_ref(), proxy_probe_url) {
+        Ok(detail) => {
+            let _ = tx.send(WorkerEvent::ProxyAccess {
+                ok: true,
+                detail: format!("Proxy access: OK ({detail})"),
+            });
+            log_event(
+                &tx,
+                format!("Proxy connectivity check passed for {proxy_probe_url}: {detail}"),
+            );
+        }
+        Err(e) => {
+            let msg = format!("Proxy access: FAILED ({e})");
+            let _ = tx.send(WorkerEvent::ProxyAccess {
+                ok: false,
+                detail: msg.clone(),
+            });
+            log_event(
+                &tx,
+                format!("Proxy connectivity check failed for {proxy_probe_url}: {e}"),
+            );
+        }
+    }
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -849,15 +894,69 @@ fn send_request_with_fallback(
             if let Some(fallback_client) = fallback {
                 match fallback_client.get(url).send() {
                     Ok(resp) => Ok(resp),
-                    Err(fallback_err) => Err(anyhow::anyhow!(
-                        "request failed (primary and fallback): primary={primary_err}; fallback={fallback_err}"
-                    )),
+                    Err(fallback_err) => Err(anyhow::anyhow!(format!(
+                        "request failed (primary and fallback): primary=[{}]; fallback=[{}]",
+                        describe_reqwest_error(&primary_err),
+                        describe_reqwest_error(&fallback_err)
+                    ))),
                 }
             } else {
                 Err(primary_err).context("request failed")
             }
         }
     }
+}
+
+fn check_proxy_access(client: &Client, fallback: Option<&Client>, url: &str) -> Result<String> {
+    let resp = send_request_with_fallback(client, fallback, url)?;
+    let status = resp.status();
+    if status.is_success() || status.is_redirection() {
+        Ok(format!("status={status}"))
+    } else {
+        anyhow::bail!("status={status}")
+    }
+}
+
+fn describe_reqwest_error(err: &reqwest::Error) -> String {
+    let mut tags = Vec::new();
+    if err.is_connect() {
+        tags.push("connect");
+    }
+    if err.is_timeout() {
+        tags.push("timeout");
+    }
+    if err.is_request() {
+        tags.push("request");
+    }
+    if err.is_status() {
+        tags.push("status");
+    }
+
+    let kind = if tags.is_empty() {
+        "unknown".to_string()
+    } else {
+        tags.join("+")
+    };
+
+    let mut chain = Vec::new();
+    let mut src = err.source();
+    while let Some(s) = src {
+        chain.push(s.to_string());
+        src = s.source();
+    }
+
+    let chain_text = if chain.is_empty() {
+        "no-source".to_string()
+    } else {
+        chain.join(" -> ")
+    };
+
+    let url = err
+        .url()
+        .map(|u| u.as_str().to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+
+    format!("kind={kind}; url={url}; msg={err}; source={chain_text}")
 }
 
 fn build_protocol_regex() -> Result<Regex> {
