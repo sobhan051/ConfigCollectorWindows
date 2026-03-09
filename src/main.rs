@@ -109,6 +109,12 @@ struct ProtocolRule {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum Language {
+    Fa,
+    En,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 enum ProxyType {
     None,
     Http,
@@ -120,6 +126,7 @@ struct AppConfig {
     interval_minutes: u64,
     max_pages_per_channel: usize,
     lookback_days: i64,
+    language: Language,
     proxy_type: ProxyType,
     proxy_host: String,
     proxy_port: u16,
@@ -144,6 +151,7 @@ impl Default for AppConfig {
             interval_minutes: 5,
             max_pages_per_channel: 8,
             lookback_days: 1,
+            language: Language::Fa,
             proxy_type: ProxyType::None,
             proxy_host: String::new(),
             proxy_port: 1080,
@@ -299,112 +307,195 @@ impl AppState {
     }
 }
 
+impl AppState {
+    fn tr(&self, fa: &str, en: &str) -> String {
+        match self.config.language {
+            Language::Fa => shape_rtl_text(fa),
+            Language::En => en.to_string(),
+        }
+    }
+
+    fn rtl(&self) -> bool {
+        matches!(self.config.language, Language::Fa)
+    }
+}
+
+fn shape_rtl_text(input: &str) -> String {
+    input.chars().rev().collect()
+}
+
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.heading("🛰️ جمع‌آوری هوشمند کانفیگ تلگرام");
+            ui.heading(self.tr(
+                "🛰️ جمع‌آوری هوشمند کانفیگ تلگرام",
+                "🛰️ Telegram Config Collector",
+            ));
         });
 
         egui::SidePanel::left("left")
             .min_width(360.0)
             .show(ctx, |ui| {
-                ui.heading("تنظیمات اصلی");
-                ui.horizontal(|ui| {
-                    ui.label("هر چند دقیقه چک شود:");
-                    ui.add(egui::DragValue::new(&mut self.config.interval_minutes).range(1..=240));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("حداکثر صفحات هر کانال:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.config.max_pages_per_channel).range(1..=100),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("بررسی پیام‌های چند روز اخیر:");
-                    ui.add(egui::DragValue::new(&mut self.config.lookback_days).range(1..=30));
-                });
-
-                ui.separator();
-                ui.heading("پروکسی");
-                egui::ComboBox::from_label("نوع")
-                    .selected_text(match self.config.proxy_type {
-                        ProxyType::None => "بدون پروکسی",
-                        ProxyType::Http => "HTTP",
-                        ProxyType::Socks5 => "SOCKS5",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.config.proxy_type,
-                            ProxyType::None,
-                            "بدون پروکسی",
-                        );
-                        ui.selectable_value(&mut self.config.proxy_type, ProxyType::Http, "HTTP");
-                        ui.selectable_value(
-                            &mut self.config.proxy_type,
-                            ProxyType::Socks5,
-                            "SOCKS5",
-                        );
-                    });
-                ui.label("هاست پروکسی");
-                ui.text_edit_singleline(&mut self.config.proxy_host);
-                ui.horizontal(|ui| {
-                    ui.label("پورت");
-                    ui.add(egui::DragValue::new(&mut self.config.proxy_port).range(1..=65535));
-                });
-                ui.label("یوزرنیم (اختیاری)");
-                ui.text_edit_singleline(&mut self.config.proxy_username);
-                ui.label("پسورد (اختیاری)");
-                ui.text_edit_singleline(&mut self.config.proxy_password);
-
-                ui.separator();
-                ui.heading("پروتکل‌ها (فعال/غیرفعال + سقف تعداد)");
-                for (name, rule) in &mut self.config.protocol_rules {
+                let layout = if self.rtl() {
+                    egui::Layout::right_to_left(egui::Align::TOP)
+                } else {
+                    egui::Layout::left_to_right(egui::Align::TOP)
+                };
+                ui.with_layout(layout, |ui| {
+                    ui.heading(self.tr("تنظیمات اصلی", "Main Settings"));
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut rule.enabled, name);
-                        ui.label("حداکثر:");
-                        ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000));
+                        ui.label(self.tr("زبان رابط:", "UI Language:"));
+                        egui::ComboBox::from_id_source("language")
+                            .selected_text(match self.config.language {
+                                Language::Fa => self.tr("فارسی", "Persian"),
+                                Language::En => "English".to_string(),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.config.language,
+                                    Language::Fa,
+                                    self.tr("فارسی", "Persian"),
+                                );
+                                ui.selectable_value(
+                                    &mut self.config.language,
+                                    Language::En,
+                                    "English",
+                                );
+                            });
                     });
-                }
+                    ui.horizontal(|ui| {
+                        ui.label(&self.tr("هر چند دقیقه چک شود:", "Check interval (minutes):"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.interval_minutes).range(1..=240),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(&self.tr("حداکثر صفحات هر کانال:", "Max pages per channel:"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.max_pages_per_channel)
+                                .range(1..=100),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(&self.tr("بررسی پیام‌های چند روز اخیر:", "Look back days:"));
+                        ui.add(egui::DragValue::new(&mut self.config.lookback_days).range(1..=30));
+                    });
 
-                ui.separator();
-                if ui.button("💾 ذخیره کانال‌ها و تنظیمات").clicked() {
-                    match save_channels(&self.channels_text).and_then(|_| self.config.save()) {
-                        Ok(_) => self.logs.push("تنظیمات ذخیره شد.".to_string()),
-                        Err(e) => self.logs.push(format!("خطا در ذخیره: {e:#}")),
-                    }
-                }
-                if !self.running {
-                    if ui.button("▶️ شروع").clicked() {
-                        self.start();
-                    }
-                } else if ui.button("⏹ توقف").clicked() {
-                    self.stop();
-                }
+                    ui.separator();
+                    ui.heading(&self.tr("پروکسی", "Proxy"));
+                    egui::ComboBox::from_label(self.tr("نوع", "Type"))
+                        .selected_text(match self.config.proxy_type {
+                            ProxyType::None => self.tr("بدون پروکسی", "No proxy"),
+                            ProxyType::Http => "HTTP",
+                            ProxyType::Socks5 => "SOCKS5",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.config.proxy_type,
+                                ProxyType::None,
+                                self.tr("بدون پروکسی", "No proxy"),
+                            );
+                            ui.selectable_value(
+                                &mut self.config.proxy_type,
+                                ProxyType::Http,
+                                "HTTP",
+                            );
+                            ui.selectable_value(
+                                &mut self.config.proxy_type,
+                                ProxyType::Socks5,
+                                "SOCKS5",
+                            );
+                        });
+                    ui.label(&self.tr("هاست پروکسی", "Proxy host"));
+                    ui.text_edit_singleline(&mut self.config.proxy_host);
+                    ui.horizontal(|ui| {
+                        ui.label(&self.tr("پورت", "Port"));
+                        ui.add(egui::DragValue::new(&mut self.config.proxy_port).range(1..=65535));
+                    });
+                    ui.label(&self.tr("یوزرنیم (اختیاری)", "Username (optional)"));
+                    ui.text_edit_singleline(&mut self.config.proxy_username);
+                    ui.label(&self.tr("پسورد (اختیاری)", "Password (optional)"));
+                    ui.text_edit_singleline(&mut self.config.proxy_password);
 
-                ui.separator();
-                ui.label(format!("مجموع جدیدها: {}", self.total_configs));
-                for (k, v) in &self.by_protocol {
-                    ui.label(format!("{k}: {v}"));
-                }
+                    ui.separator();
+                    ui.heading(&self.tr(
+                        "پروتکل‌ها (فعال/غیرفعال + سقف تعداد)",
+                        "Protocols (Enable/Disable + Limit)",
+                    ));
+                    for (name, rule) in &mut self.config.protocol_rules {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut rule.enabled, name);
+                            ui.label(&self.tr("حداکثر:", "Max:"));
+                            ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000));
+                        });
+                    }
+
+                    ui.separator();
+                    if ui
+                        .button(
+                            &self.tr("💾 ذخیره کانال‌ها و تنظیمات", "💾 Save channels & settings"),
+                        )
+                        .clicked()
+                    {
+                        match save_channels(&self.channels_text).and_then(|_| self.config.save()) {
+                            Ok(_) => self.logs.push("تنظیمات ذخیره شد.".to_string()),
+                            Err(e) => self.logs.push(format!("خطا در ذخیره: {e:#}")),
+                        }
+                    }
+                    if !self.running {
+                        if ui.button(&self.tr("▶️ شروع", "▶️ Start")).clicked() {
+                            self.start();
+                        }
+                    } else if ui.button(&self.tr("⏹ توقف", "⏹ Stop")).clicked() {
+                        self.stop();
+                    }
+
+                    ui.separator();
+                    ui.label(match self.config.language {
+                        Language::Fa => format!(
+                            "{} :{}",
+                            self.tr("مجموع جدیدها", "Total new"),
+                            self.total_configs
+                        ),
+                        Language::En => format!("Total new: {}", self.total_configs),
+                    });
+                    for (k, v) in &self.by_protocol {
+                        ui.label(format!("{k}: {v}"));
+                    }
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("لیست کانال‌ها (هر خط یک کانال)");
-            ui.add_sized(
-                [ui.available_width(), 180.0],
-                egui::TextEdit::multiline(&mut self.channels_text),
-            );
-            ui.separator();
-            ui.heading("لاگ حرفه‌ای");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in self.logs.iter().rev().take(300).rev() {
-                        ui.label(line);
-                    }
-                });
+            let layout = if self.rtl() {
+                egui::Layout::right_to_left(egui::Align::TOP)
+            } else {
+                egui::Layout::left_to_right(egui::Align::TOP)
+            };
+            ui.with_layout(layout, |ui| {
+                ui.heading(&self.tr(
+                    "لیست کانال‌ها (هر خط یک کانال)",
+                    "Channels list (one per line)",
+                ));
+                ui.add_sized(
+                    [ui.available_width(), 180.0],
+                    egui::TextEdit::multiline(&mut self.channels_text),
+                );
+                ui.separator();
+                ui.heading(&self.tr("لاگ حرفه‌ای", "Professional logs"));
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in self.logs.iter().rev().take(300).rev() {
+                            if self.rtl() {
+                                ui.label(shape_rtl_text(line));
+                            } else {
+                                ui.label(line);
+                            }
+                        }
+                    });
+            });
         });
 
         ctx.request_repaint_after(Duration::from_millis(250));
