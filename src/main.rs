@@ -6,7 +6,6 @@ use reqwest::blocking::{Client, ClientBuilder};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,39 +21,21 @@ const OUTPUT_APPEND_DIR: &str = "output/append_unique";
 const LOG_FILE: &str = "logs/app.log";
 const HISTORY_PATH: &str = "output/sent_history.json";
 const DEFAULT_PROTOCOLS: [&str; 27] = [
-    "vmess",
-    "vless",
-    "trojan",
-    "ss",
-    "ssr",
-    "tuic",
-    "hysteria",
-    "hysteria2",
-    "hy2",
-    "juicity",
-    "snell",
-    "anytls",
-    "ssh",
-    "wireguard",
-    "wg",
-    "warp",
-    "socks",
-    "socks4",
-    "socks5",
-    "tg",
-    "dns",
-    "nm-dns",
-    "nm-vless",
-    "slipnet-enc",
-    "slipnet",
-    "slipstream",
-    "dnstt",
+    "vmess", "vless", "trojan", "ss", "ssr", "tuic", "hysteria", "hysteria2", "hy2", "juicity",
+    "snell", "anytls", "ssh", "wireguard", "wg", "warp", "socks", "socks4", "socks5", "tg", "dns",
+    "nm-dns", "nm-vless", "slipnet-enc", "slipnet", "slipstream", "dnstt",
 ];
 
 fn main() {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 650.0])
+            .with_min_inner_size([800.0, 500.0]),
+        ..Default::default()
+    };
     let _ = eframe::run_native(
         "Telegram Config Collector",
-        eframe::NativeOptions::default(),
+        options,
         Box::new(|_| Ok(Box::new(AppState::bootstrap()))),
     );
 }
@@ -103,11 +84,11 @@ impl Default for AppConfig {
         }
         Self {
             interval_minutes: 5,
-            max_pages_per_channel: 8,
-            lookback_days: 1,
-            proxy_type: ProxyType::None,
-            proxy_host: String::new(),
-            proxy_port: 1080,
+            max_pages_per_channel: 15,
+            lookback_days: 2,
+            proxy_type: ProxyType::System,
+            proxy_host: "127.0.0.1".to_string(),
+            proxy_port: 10808,
             proxy_username: String::new(),
             proxy_password: String::new(),
             output_new_only_enabled: true,
@@ -172,8 +153,23 @@ impl SentHistory {
 }
 
 #[derive(Clone, Debug)]
+enum LogLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+struct LogMessage {
+    time: String,
+    level: LogLevel,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
 enum WorkerEvent {
-    Log(String),
+    Log(LogLevel, String),
     Stats {
         total: usize,
         by_protocol: BTreeMap<String, usize>,
@@ -187,10 +183,10 @@ enum WorkerEvent {
 struct AppState {
     config: AppConfig,
     channels_text: String,
-    show_channels_editor: bool,
+    active_tab: usize,
     proxy_access_status: String,
     proxy_access_ok: Option<bool>,
-    logs: Vec<String>,
+    logs: Vec<LogMessage>,
     total_configs: usize,
     by_protocol: BTreeMap<String, usize>,
     running: bool,
@@ -204,12 +200,16 @@ impl AppState {
         Self {
             config: AppConfig::load_or_create(),
             channels_text: fs::read_to_string(CHANNELS_PATH).unwrap_or_else(|_| {
-                "# one channel per line\n# @channel\n# https://t.me/channel".to_string()
+                "# One channel per line\n# @channel\n# https://t.me/channel\nIranProxyPlus".to_string()
             }),
-            show_channels_editor: true,
-            proxy_access_status: "Proxy access: not checked yet".to_string(),
+            active_tab: 0,
+            proxy_access_status: "Waiting for connection...".to_string(),
             proxy_access_ok: None,
-            logs: vec!["Application is ready.".to_string()],
+            logs: vec![LogMessage {
+                time: Local::now().format("%H:%M:%S").to_string(),
+                level: LogLevel::Info,
+                text: "System initialized and ready.".to_string(),
+            }],
             total_configs: 0,
             by_protocol: BTreeMap::new(),
             running: false,
@@ -224,7 +224,7 @@ impl AppState {
             return;
         }
         if let Err(e) = save_channels(&self.channels_text).and_then(|_| self.config.save()) {
-            self.logs.push(format!("Failed to save settings: {e:#}"));
+            self.add_log(LogLevel::Error, format!("Failed to save settings: {e:#}"));
             return;
         }
 
@@ -238,22 +238,32 @@ impl AppState {
 
         self.worker_handle = Some(thread::spawn(move || {
             if let Err(err) = run_worker(cfg, channels_raw, stop_flag, tx.clone()) {
-                let _ = tx.send(WorkerEvent::Log(format!("Critical error: {err:#}")));
+                let _ = tx.send(WorkerEvent::Log(
+                    LogLevel::Error,
+                    format!("Critical error: {err:#}"),
+                ));
             }
         }));
     }
 
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        self.running = false;
-        self.logs.push("Stop requested.".to_string());
+        self.add_log(LogLevel::Warning, "Stop requested. Waiting for worker...".to_string());
+    }
+
+    fn add_log(&mut self, level: LogLevel, text: String) {
+        self.logs.push(LogMessage {
+            time: Local::now().format("%H:%M:%S").to_string(),
+            level,
+            text,
+        });
     }
 
     fn poll_events(&mut self) {
         if let Some(rx) = &self.event_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    WorkerEvent::Log(msg) => self.logs.push(msg),
+                    WorkerEvent::Log(level, msg) => self.add_log(level, msg),
                     WorkerEvent::Stats { total, by_protocol } => {
                         self.total_configs = total;
                         self.by_protocol = by_protocol;
@@ -269,6 +279,7 @@ impl AppState {
             if handle.is_finished() {
                 let _ = handle.join();
                 self.running = false;
+                self.add_log(LogLevel::Warning, "Worker thread has stopped.".to_string());
             } else {
                 self.worker_handle = Some(handle);
             }
@@ -276,255 +287,224 @@ impl AppState {
     }
 }
 
+// 🎨 طراح رابط کاربری (Theme Setup)
+fn apply_modern_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = egui::Color32::from_rgb(15, 17, 26);
+    visuals.window_fill = egui::Color32::from_rgb(20, 23, 33);
+    
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(26, 30, 41);
+    visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(200, 205, 215);
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+    
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(33, 38, 51);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
+    
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 52, 69);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
+    
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(59, 130, 246);
+    visuals.widgets.active.rounding = egui::Rounding::same(8.0);
+    
+    visuals.selection.bg_fill = egui::Color32::from_rgb(59, 130, 246);
+    ctx.set_visuals(visuals);
+
+    ctx.style_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+        style.spacing.window_margin = egui::Margin::same(15.0);
+        style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    });
+}
+
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
+        apply_modern_theme(ctx);
 
-        let mut visuals = egui::Visuals::dark();
-        visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
-        visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
-        visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
-        visuals.widgets.active.rounding = egui::Rounding::same(8.0);
-        visuals.override_text_color = Some(egui::Color32::from_rgb(230, 233, 238));
-        visuals.selection.bg_fill = egui::Color32::from_rgb(57, 119, 255);
-        visuals.panel_fill = egui::Color32::from_rgb(18, 20, 26);
-        visuals.extreme_bg_color = egui::Color32::from_rgb(12, 13, 18);
-        ctx.set_visuals(visuals);
-
-        ctx.style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            style.spacing.button_padding = egui::vec2(10.0, 6.0);
-            style.spacing.indent = 14.0;
-        });
-
-        egui::TopBottomPanel::top("header")
-            .exact_height(68.0)
-            .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.heading("🛰️ Telegram Config Collector");
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("Total new: {}", self.total_configs)).strong(),
-                    );
-
-                    if !self.running {
-                        if ui
-                            .add(
-                                egui::Button::new("▶ Start Collection")
-                                    .fill(egui::Color32::from_rgb(36, 116, 242)),
-                            )
-                            .clicked()
-                        {
+        // Header Panel
+        egui::TopBottomPanel::top("header").exact_height(70.0).frame(
+            egui::Frame::default().fill(egui::Color32::from_rgb(20, 23, 33)).inner_margin(15.0)
+        ).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("🚀 Telegram Config Collector").size(24.0).strong().color(egui::Color32::from_rgb(240, 240, 240)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.running {
+                        if ui.add(egui::Button::new(egui::RichText::new("⏹ Stop Process").strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(220, 38, 38))).clicked() {
+                            self.stop();
+                        }
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Scraping in progress...").color(egui::Color32::from_rgb(59, 130, 246)));
+                    } else {
+                        if ui.add(egui::Button::new(egui::RichText::new("▶ Start Scraping").strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(16, 185, 129))).clicked() {
                             self.start();
                         }
-                    } else if ui
-                        .add(egui::Button::new("⏹ Stop").fill(egui::Color32::from_rgb(170, 54, 54)))
-                        .clicked()
-                    {
-                        self.stop();
-                    }
-
-                    if ui.button("💾 Save Settings").clicked() {
-                        match save_channels(&self.channels_text).and_then(|_| self.config.save()) {
-                            Ok(_) => self.logs.push("Settings saved.".to_string()),
-                            Err(e) => self.logs.push(format!("Save failed: {e:#}")),
+                        if ui.button("💾 Save Configs").clicked() {
+                            let _ = save_channels(&self.channels_text);
+                            let _ = self.config.save();
+                            self.add_log(LogLevel::Success, "Settings saved successfully.".to_string());
                         }
                     }
-
-                    let channels_btn = if self.show_channels_editor {
-                        "Hide Channels"
-                    } else {
-                        "Show Channels"
-                    };
-                    if ui.button(channels_btn).clicked() {
-                        self.show_channels_editor = !self.show_channels_editor;
-                    }
-
-                    if ui.button("📋 Copy Logs").clicked() {
-                        let all_logs = self.logs.join("\n");
-                        ctx.output_mut(|o| o.copied_text = all_logs);
-                        self.logs.push("Logs copied to clipboard.".to_string());
-                    }
                 });
             });
+        });
 
-        egui::TopBottomPanel::top("proxy_status")
-            .exact_height(28.0)
-            .show(ctx, |ui| {
-                let proxy_color = match self.proxy_access_ok {
-                    Some(true) => egui::Color32::from_rgb(90, 200, 120),
-                    Some(false) => egui::Color32::from_rgb(232, 92, 92),
-                    None => egui::Color32::from_rgb(180, 180, 180),
-                };
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("●").color(proxy_color).strong());
-                    ui.label(egui::RichText::new(&self.proxy_access_status).color(proxy_color));
-                    ui.label("(details are in logs)");
-                });
+        // Left Sidebar Settings
+        egui::SidePanel::left("sidebar").default_width(320.0).frame(
+            egui::Frame::default().fill(egui::Color32::from_rgb(20, 23, 33)).inner_margin(15.0)
+        ).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.active_tab, 0, "📡 Settings");
+                ui.selectable_value(&mut self.active_tab, 1, "📝 Channels");
+                ui.selectable_value(&mut self.active_tab, 2, "⚙️ Protocols");
             });
+            ui.separator();
 
-        egui::SidePanel::left("settings_panel")
-            .resizable(true)
-            .default_width(370.0)
-            .min_width(320.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.group(|ui| {
-                        ui.heading("Main Settings");
-                        ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                match self.active_tab {
+                    0 => {
+                        // General Settings
+                        ui.heading(egui::RichText::new("Scraping Rules").color(egui::Color32::LIGHT_BLUE));
+                        ui.add_space(5.0);
                         ui.horizontal(|ui| {
-                            ui.label("Check interval (minutes)");
-                            ui.add(
-                                egui::DragValue::new(&mut self.config.interval_minutes)
-                                    .range(1..=240),
-                            );
+                            ui.label("Interval (Minutes):");
+                            ui.add(egui::DragValue::new(&mut self.config.interval_minutes).range(1..=240));
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Max pages per channel");
-                            ui.add(
-                                egui::DragValue::new(&mut self.config.max_pages_per_channel)
-                                    .range(1..=100),
-                            );
+                            ui.label("Max Pages/Channel:");
+                            ui.add(egui::DragValue::new(&mut self.config.max_pages_per_channel).range(1..=100));
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Look back days");
-                            ui.add(
-                                egui::DragValue::new(&mut self.config.lookback_days).range(1..=30),
-                            );
+                            ui.label("Lookback Days:");
+                            ui.add(egui::DragValue::new(&mut self.config.lookback_days).range(1..=30));
                         });
-                    });
 
-                    ui.add_space(10.0);
-                    ui.group(|ui| {
-                        ui.heading("Proxy");
-                        ui.separator();
-                        egui::ComboBox::from_label("Type")
+                        ui.add_space(15.0);
+                        ui.heading(egui::RichText::new("Network & Proxy").color(egui::Color32::LIGHT_BLUE));
+                        ui.add_space(5.0);
+                        egui::ComboBox::from_label("Connection Type")
                             .selected_text(match self.config.proxy_type {
-                                ProxyType::None => "No proxy",
-                                ProxyType::System => "System proxy",
-                                ProxyType::Http => "HTTP",
-                                ProxyType::Socks5 => "SOCKS5",
+                                ProxyType::None => "Direct (No Proxy)",
+                                ProxyType::System => "System Proxy",
+                                ProxyType::Http => "HTTP Proxy",
+                                ProxyType::Socks5 => "SOCKS5 Proxy",
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.config.proxy_type,
-                                    ProxyType::None,
-                                    "No proxy",
-                                );
-                                ui.selectable_value(
-                                    &mut self.config.proxy_type,
-                                    ProxyType::System,
-                                    "System proxy",
-                                );
-                                ui.selectable_value(
-                                    &mut self.config.proxy_type,
-                                    ProxyType::Http,
-                                    "HTTP",
-                                );
-                                ui.selectable_value(
-                                    &mut self.config.proxy_type,
-                                    ProxyType::Socks5,
-                                    "SOCKS5",
-                                );
+                                ui.selectable_value(&mut self.config.proxy_type, ProxyType::System, "System Proxy");
+                                ui.selectable_value(&mut self.config.proxy_type, ProxyType::Socks5, "SOCKS5 Proxy");
+                                ui.selectable_value(&mut self.config.proxy_type, ProxyType::Http, "HTTP Proxy");
+                                ui.selectable_value(&mut self.config.proxy_type, ProxyType::None, "Direct (No Proxy)");
                             });
 
                         if matches!(self.config.proxy_type, ProxyType::Http | ProxyType::Socks5) {
-                            ui.label("Proxy host");
-                            ui.text_edit_singleline(&mut self.config.proxy_host);
                             ui.horizontal(|ui| {
-                                ui.label("Port");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.config.proxy_port)
-                                        .range(1..=65535),
-                                );
+                                ui.label("IP:");
+                                ui.text_edit_singleline(&mut self.config.proxy_host);
                             });
-                            ui.label("Username (optional)");
-                            ui.text_edit_singleline(&mut self.config.proxy_username);
-                            ui.label("Password (optional)");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.config.proxy_password)
-                                    .password(true),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label("Port:");
+                                ui.add(egui::DragValue::new(&mut self.config.proxy_port).range(1..=65535));
+                            });
                         }
-                    });
 
-                    ui.add_space(10.0);
-                    ui.group(|ui| {
-                        ui.heading("Output Modes");
-                        ui.separator();
-                        ui.checkbox(
-                            &mut self.config.output_new_only_enabled,
-                            "Replace with new-only output (output/new_only)",
+                        ui.add_space(15.0);
+                        ui.heading(egui::RichText::new("Storage Modes").color(egui::Color32::LIGHT_BLUE));
+                        ui.add_space(5.0);
+                        ui.checkbox(&mut self.config.output_new_only_enabled, "Save as 'New Only'");
+                        ui.checkbox(&mut self.config.output_append_unique_enabled, "Append to 'Unique List'");
+                    }
+                    1 => {
+                        ui.heading(egui::RichText::new("Target Channels").color(egui::Color32::LIGHT_BLUE));
+                        ui.label(egui::RichText::new("One per line (e.g., @v2ray_config)").small().color(egui::Color32::GRAY));
+                        ui.add_sized(
+                            [ui.available_width(), ui.available_height() - 20.0],
+                            egui::TextEdit::multiline(&mut self.channels_text).font(egui::TextStyle::Monospace),
                         );
-                        ui.checkbox(
-                            &mut self.config.output_append_unique_enabled,
-                            "Append unique output (output/append_unique)",
-                        );
-                    });
-
-                    ui.add_space(10.0);
-                    ui.group(|ui| {
-                        ui.heading("Protocols (Enable/Disable + Limit)");
-                        ui.separator();
+                    }
+                    2 => {
+                        ui.heading(egui::RichText::new("Protocols Filter").color(egui::Color32::LIGHT_BLUE));
                         for (name, rule) in &mut self.config.protocol_rules {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut rule.enabled, name);
-                                ui.add_space(4.0);
-                                ui.label("Max");
-                                ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000));
+                                });
                             });
                         }
-                    });
+                    }
+                    _ => {}
+                }
+            });
+        });
+
+        // Main Console Area
+        egui::CentralPanel::default().frame(
+            egui::Frame::default().fill(egui::Color32::from_rgb(15, 17, 26)).inner_margin(15.0)
+        ).show(ctx, |ui| {
+            // Stats Header
+            ui.horizontal(|ui| {
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Total Extracted:").color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new(self.total_configs.to_string()).size(20.0).strong().color(egui::Color32::from_rgb(16, 185, 129)));
+                });
+                
+                let proxy_color = match self.proxy_access_ok {
+                    Some(true) => egui::Color32::from_rgb(16, 185, 129),
+                    Some(false) => egui::Color32::from_rgb(239, 68, 68),
+                    None => egui::Color32::GRAY,
+                };
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Connection Status:").color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new(&self.proxy_access_status).size(14.0).strong().color(proxy_color));
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.show_channels_editor {
-                ui.columns(2, |columns| {
-                    columns[0].group(|ui| {
-                        ui.heading("Channels");
-                        ui.label("One channel per line (@channel or https://t.me/channel)");
-                        ui.add_space(4.0);
-                        ui.add_sized(
-                            [ui.available_width(), ui.available_height() - 12.0],
-                            egui::TextEdit::multiline(&mut self.channels_text),
-                        );
+            ui.add_space(10.0);
+            
+            // Terminal Window
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(10, 12, 16))
+                .rounding(10.0)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(egui::RichText::new("Terminal Logs").color(egui::Color32::WHITE));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("📋 Copy Logs").clicked() {
+                                let txt = self.logs.iter().map(|l| format!("[{}] {}", l.time, l.text)).collect::<Vec<_>>().join("\n");
+                                ctx.output_mut(|o| o.copied_text = txt);
+                            }
+                        });
                     });
-
-                    render_logs_and_stats(&self.logs, &self.by_protocol, &mut columns[1]);
+                    ui.separator();
+                    
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            for log in self.logs.iter().rev().take(300).rev() {
+                                let color = match log.level {
+                                    LogLevel::Info => egui::Color32::from_rgb(156, 163, 175), // Gray
+                                    LogLevel::Success => egui::Color32::from_rgb(52, 211, 153), // Green
+                                    LogLevel::Warning => egui::Color32::from_rgb(251, 191, 36), // Yellow
+                                    LogLevel::Error => egui::Color32::from_rgb(248, 113, 113), // Red
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("[{}]", log.time)).color(egui::Color32::from_rgb(75, 85, 99)).monospace());
+                                    ui.label(egui::RichText::new(&log.text).color(color).monospace());
+                                });
+                            }
+                        });
                 });
-            } else {
-                ui.group(|ui| {
-                    render_logs_and_stats(&self.logs, &self.by_protocol, ui);
-                });
-            }
         });
 
-        ctx.request_repaint_after(Duration::from_millis(200));
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
-fn render_logs_and_stats(
-    logs: &[String],
-    by_protocol: &BTreeMap<String, usize>,
-    ui: &mut egui::Ui,
-) {
-    ui.heading("Live Logs");
-    ui.separator();
-    egui::ScrollArea::vertical()
-        .stick_to_bottom(true)
-        .show(ui, |ui| {
-            for line in logs.iter().rev().take(400).rev() {
-                ui.label(line);
-            }
-        });
-    ui.separator();
-    ui.heading("By protocol");
-    for (k, v) in by_protocol {
-        ui.label(format!("{k}: {v}"));
-    }
-}
+// -------------------------------------------------------------
+// Core Network & Worker Logic (Completely Redesigned Fallback)
+// -------------------------------------------------------------
 
 fn run_worker(
     config: AppConfig,
@@ -534,85 +514,72 @@ fn run_worker(
 ) -> Result<()> {
     let channels = parse_channels(&channels_raw);
     if channels.is_empty() {
-        let _ = tx.send(WorkerEvent::Log(
-            "No valid channels were provided.".to_string(),
-        ));
+        let _ = tx.send(WorkerEvent::Log(LogLevel::Error, "No valid channels provided.".to_string()));
         return Ok(());
     }
 
-    let client = build_client(&config)?;
-    let fallback_client = build_fallback_client(&config)?;
+    let client_result = build_client(&config);
+    let client = match client_result {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(WorkerEvent::Log(LogLevel::Error, format!("Failed to build client: {}", e)));
+            return Ok(());
+        }
+    };
+    
     let regex = build_protocol_regex()?;
     let mut history = SentHistory::load();
 
-    log_event(
-        &tx,
-        format!(
-            "Proxy mode: {}",
-            match config.proxy_type {
-                ProxyType::None => "No proxy",
-                ProxyType::System => "System proxy",
-                ProxyType::Http => "HTTP",
-                ProxyType::Socks5 => "SOCKS5",
-            }
-        ),
-    );
+    let mode_str = match config.proxy_type {
+        ProxyType::None => "Direct Access (No Proxy)",
+        ProxyType::System => "System Proxy",
+        ProxyType::Http => "HTTP Proxy",
+        ProxyType::Socks5 => "SOCKS5 Proxy (Secure DNS)",
+    };
+    log_worker(&tx, LogLevel::Info, format!("🚀 Starting worker in mode: {}", mode_str));
 
-    let proxy_probe_url = "https://web.telegram.org/a/";
-    match check_proxy_access(&client, fallback_client.as_ref(), proxy_probe_url) {
-        Ok(detail) => {
-            let _ = tx.send(WorkerEvent::ProxyAccess {
-                ok: true,
-                detail: "Proxy access to web.telegram.org: OK".to_string(),
-            });
-            log_event(
-                &tx,
-                format!("Proxy connectivity check passed for {proxy_probe_url}: {detail}"),
-            );
+    // Probe Telegram domain (not web.telegram.org to avoid web restrictions)
+    let probe_url = "https://t.me/s/telegram";
+    match client.get(probe_url).send() {
+        Ok(resp) if resp.status().is_success() => {
+            let _ = tx.send(WorkerEvent::ProxyAccess { ok: true, detail: "Connection: Online 🟢".to_string() });
+            log_worker(&tx, LogLevel::Success, "Proxy/Network connectivity check passed.".to_string());
+        }
+        Ok(resp) => {
+            let _ = tx.send(WorkerEvent::ProxyAccess { ok: false, detail: format!("HTTP {}", resp.status()) });
+            log_worker(&tx, LogLevel::Warning, format!("Connectivity check returned status: {}", resp.status()));
         }
         Err(e) => {
-            let msg = "Proxy access to web.telegram.org: FAILED".to_string();
-            let _ = tx.send(WorkerEvent::ProxyAccess {
-                ok: false,
-                detail: msg.clone(),
-            });
-            log_event(
-                &tx,
-                format!("Proxy connectivity check failed for {proxy_probe_url}: {e}"),
-            );
+            let _ = tx.send(WorkerEvent::ProxyAccess { ok: false, detail: "Connection: Failed 🔴".to_string() });
+            log_worker(&tx, LogLevel::Error, format!("Network check failed. Error: {}", e));
         }
     }
 
     loop {
-        if stop.load(Ordering::SeqCst) {
-            log_event(&tx, "Worker stopped.".to_string());
-            break;
-        }
+        if stop.load(Ordering::SeqCst) { break; }
 
         history.prune(config.lookback_days);
         let threshold = Utc::now() - ChronoDuration::days(config.lookback_days.max(1));
         let mut gathered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         for channel in &channels {
-            log_event(&tx, format!("Processing @{channel}"));
-            let result = fetch_channel_configs(
-                &client,
-                fallback_client.as_ref(),
-                channel,
-                config.max_pages_per_channel,
-                threshold,
-                &regex,
-                &config.protocol_rules,
-            );
-            match result {
+            if stop.load(Ordering::SeqCst) { break; }
+            log_worker(&tx, LogLevel::Info, format!("📥 Scraping @{} ...", channel));
+            
+            match fetch_channel_configs(&client, channel, config.max_pages_per_channel, threshold, &regex, &config.protocol_rules, &tx) {
                 Ok(map) => {
+                    let mut count = 0;
                     for (p, links) in map {
+                        count += links.len();
                         gathered.entry(p).or_default().extend(links);
                     }
+                    if count > 0 {
+                        log_worker(&tx, LogLevel::Success, format!("Found {} raw configs from @{}", count, channel));
+                    }
                 }
-                Err(e) => log_event(&tx, format!("Error on @{channel}: {e:#}")),
+                Err(e) => log_worker(&tx, LogLevel::Error, format!("Failed on @{}: {}", channel, e)),
             }
-            thread::sleep(Duration::from_millis(700));
+            thread::sleep(Duration::from_secs(2)); // Safe delay between channels
         }
 
         let mut new_only: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -626,48 +593,40 @@ fn run_worker(
         }
 
         apply_protocol_limits(&mut new_only, &config.protocol_rules);
-        if config.output_new_only_enabled {
-            write_outputs_replace(OUTPUT_NEW_DIR, &new_only)?;
-        }
-        if config.output_append_unique_enabled {
-            write_outputs_append_unique(OUTPUT_APPEND_DIR, &new_only)?;
-        }
-        if !config.output_new_only_enabled && !config.output_append_unique_enabled {
-            log_event(
-                &tx,
-                "No output mode enabled; skipping file writes.".to_string(),
-            );
-        }
-        history.prune(config.lookback_days);
-        history.save()?;
-
+        
         let mut by_protocol = BTreeMap::new();
-        let mut total = 0;
+        let mut total_new = 0;
         for (k, v) in &new_only {
             by_protocol.insert(k.clone(), v.len());
-            total += v.len();
+            total_new += v.len();
         }
-        let _ = tx.send(WorkerEvent::Stats { total, by_protocol });
-        log_event(&tx, format!("Completed. New configs found: {total}"));
+        
+        if config.output_new_only_enabled { let _ = write_outputs_replace(OUTPUT_NEW_DIR, &new_only); }
+        if config.output_append_unique_enabled { let _ = write_outputs_append_unique(OUTPUT_APPEND_DIR, &new_only); }
+        
+        let _ = history.save();
+        let _ = tx.send(WorkerEvent::Stats { total: total_new, by_protocol });
+        
+        log_worker(&tx, LogLevel::Success, format!("✅ Cycle complete. Saved {} NEW unique configs.", total_new));
+        log_worker(&tx, LogLevel::Info, format!("💤 Sleeping for {} minutes...", config.interval_minutes));
 
         for _ in 0..(config.interval_minutes * 60) {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
+            if stop.load(Ordering::SeqCst) { break; }
             thread::sleep(Duration::from_secs(1));
         }
     }
+    log_worker(&tx, LogLevel::Warning, "Worker thread terminated safely.".to_string());
     Ok(())
 }
 
 fn fetch_channel_configs(
     client: &Client,
-    fallback_client: Option<&Client>,
     channel: &str,
     max_pages: usize,
     threshold: DateTime<Utc>,
     pattern: &Regex,
     rules: &BTreeMap<String, ProtocolRule>,
+    tx: &Sender<WorkerEvent>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let wrap_sel = Selector::parse("div.tgme_widget_message").unwrap();
     let text_sel = Selector::parse("div.tgme_widget_message_text").unwrap();
@@ -676,51 +635,46 @@ fn fetch_channel_configs(
     let mut result: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut before: Option<String> = None;
 
-    for _ in 0..max_pages {
-        let urls = channel_page_urls(channel, before.as_deref());
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut resp_opt = None;
-        for url in &urls {
-            match send_request_with_fallback(client, fallback_client, url) {
-                Ok(resp) => {
-                    resp_opt = Some(resp);
-                    break;
-                }
-                Err(e) => last_err = Some(anyhow::anyhow!("{url}: {e}")),
-            }
+    for page in 1..=max_pages {
+        let mut url = format!("https://t.me/s/{}", channel);
+        if let Some(ref id) = before {
+            url.push_str(&format!("?before={}", id));
         }
-        let resp = match resp_opt {
-            Some(r) => r,
-            None => {
-                return Err(
-                    last_err.unwrap_or_else(|| anyhow::anyhow!("all channel URL attempts failed"))
-                )
-            }
+
+        let resp = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => anyhow::bail!("Request failed: {}", e),
         };
-        if !resp.status().is_success() {
-            anyhow::bail!("status={}", resp.status());
+
+        if resp.status().as_u16() == 429 {
+            log_worker(tx, LogLevel::Warning, "Rate limit (429) hit! Sleeping for 5 seconds...".to_string());
+            thread::sleep(Duration::from_secs(5));
+            continue; // Retry same page
         }
+
+        if !resp.status().is_success() {
+            anyhow::bail!("HTTP Status: {}", resp.status());
+        }
+
         let body = resp.text()?;
         let doc = Html::parse_document(&body);
         let mut found_any = false;
         let mut next_before = None;
-        let mut should_stop_for_old = false;
+        let mut should_stop = false;
 
         for wrap in doc.select(&wrap_sel) {
             if let Some(post) = wrap.value().attr("data-post") {
                 next_before = post.split('/').nth(1).map(|s| s.to_string());
             }
 
-            let msg_time = wrap
-                .select(&time_sel)
-                .next()
+            let msg_time = wrap.select(&time_sel).next()
                 .and_then(|t| t.value().attr("datetime"))
                 .and_then(|iso| DateTime::parse_from_rfc3339(iso).ok())
                 .map(|t| t.with_timezone(&Utc));
 
             if let Some(mt) = msg_time {
                 if mt < threshold {
-                    should_stop_for_old = true;
+                    should_stop = true;
                     continue;
                 }
             }
@@ -732,38 +686,79 @@ fn fetch_channel_configs(
                     if let Some(proto) = m.as_str().split("://").next() {
                         let p = proto.to_lowercase();
                         if let Some(rule) = rules.get(&p) {
-                            if !rule.enabled {
-                                continue;
+                            if rule.enabled {
+                                result.entry(p).or_default().insert(m.as_str().to_string());
                             }
-                        } else {
-                            continue;
                         }
-                        result.entry(p).or_default().insert(m.as_str().to_string());
                     }
                 }
             }
         }
 
-        if !found_any || should_stop_for_old {
+        if !found_any || should_stop {
             break;
         }
         before = next_before;
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(1500)); // Python script used 1.5s delay
     }
 
     Ok(result)
 }
 
-fn apply_protocol_limits(
-    store: &mut BTreeMap<String, BTreeSet<String>>,
-    rules: &BTreeMap<String, ProtocolRule>,
-) {
+fn build_client(config: &AppConfig) -> Result<Client> {
+    // Timeout های طولانی‌تر برای شبکه‌های ایران
+    let mut b = ClientBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15)) 
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+
+    match config.proxy_type {
+        ProxyType::None => {
+            b = b.no_proxy();
+        }
+        ProxyType::System => {
+            // به طور پیش‌فرض reqwest از پروکسی سیستم استفاده می‌کند.
+        }
+        ProxyType::Http | ProxyType::Socks5 => {
+            let scheme = match config.proxy_type {
+                ProxyType::Http => "http",
+                ProxyType::Socks5 => "socks5h", // 'h' = Remote DNS Resolution (Critical for bypass)
+                _ => unreachable!(),
+            };
+            
+            let host = if config.proxy_host.trim().is_empty() { "127.0.0.1" } else { config.proxy_host.trim() };
+            
+            let proxy_url = if config.proxy_username.trim().is_empty() {
+                format!("{}://{}:{}", scheme, host, config.proxy_port)
+            } else {
+                format!(
+                    "{}://{}:{}@{}:{}",
+                    scheme,
+                    url::form_urlencoded::byte_serialize(config.proxy_username.as_bytes()).collect::<String>(),
+                    url::form_urlencoded::byte_serialize(config.proxy_password.as_bytes()).collect::<String>(),
+                    host,
+                    config.proxy_port
+                )
+            };
+            
+            b = b.proxy(reqwest::Proxy::all(&proxy_url)?);
+        }
+    }
+
+    Ok(b.build()?)
+}
+
+// ... Utility Functions ...
+
+fn log_worker(tx: &Sender<WorkerEvent>, level: LogLevel, text: String) {
+    let _ = tx.send(WorkerEvent::Log(level, text));
+}
+
+fn apply_protocol_limits(store: &mut BTreeMap<String, BTreeSet<String>>, rules: &BTreeMap<String, ProtocolRule>) {
     for (proto, links) in store.iter_mut() {
         if let Some(rule) = rules.get(proto) {
             if links.len() > rule.max_count {
-                let limited: BTreeSet<String> =
-                    links.iter().take(rule.max_count).cloned().collect();
-                *links = limited;
+                *links = links.iter().take(rule.max_count).cloned().collect();
             }
         }
     }
@@ -774,226 +769,39 @@ fn write_outputs_replace(base_dir: &str, store: &BTreeMap<String, BTreeSet<Strin
     let mut mixed = Vec::new();
     for (p, links) in store {
         let lines: Vec<String> = links.iter().cloned().collect();
-        fs::write(
-            Path::new(base_dir).join(format!("{p}.txt")),
-            lines.join("\n"),
-        )?;
+        fs::write(Path::new(base_dir).join(format!("{p}.txt")), lines.join("\n"))?;
         mixed.extend(lines);
     }
     fs::write(Path::new(base_dir).join("mixed.txt"), mixed.join("\n"))?;
     Ok(())
 }
 
-fn write_outputs_append_unique(
-    base_dir: &str,
-    store: &BTreeMap<String, BTreeSet<String>>,
-) -> Result<()> {
+fn write_outputs_append_unique(base_dir: &str, store: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
     fs::create_dir_all(base_dir)?;
-
     for (p, links) in store {
         let path = Path::new(base_dir).join(format!("{p}.txt"));
         let mut combined = read_existing_set(&path)?;
         combined.extend(links.iter().cloned());
-        let lines: Vec<String> = combined.into_iter().collect();
-        fs::write(&path, lines.join("\n"))?;
+        fs::write(&path, combined.into_iter().collect::<Vec<_>>().join("\n"))?;
     }
-
     let mixed_path = Path::new(base_dir).join("mixed.txt");
     let mut mixed = read_existing_set(&mixed_path)?;
-    for links in store.values() {
-        mixed.extend(links.iter().cloned());
-    }
-    let mixed_lines: Vec<String> = mixed.into_iter().collect();
-    fs::write(mixed_path, mixed_lines.join("\n"))?;
-
+    for links in store.values() { mixed.extend(links.iter().cloned()); }
+    fs::write(mixed_path, mixed.into_iter().collect::<Vec<_>>().join("\n"))?;
     Ok(())
 }
 
 fn read_existing_set(path: &Path) -> Result<BTreeSet<String>> {
-    if !path.exists() {
-        return Ok(BTreeSet::new());
-    }
-    let raw = fs::read_to_string(path)?;
-    Ok(raw
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+    if !path.exists() { return Ok(BTreeSet::new()); }
+    Ok(fs::read_to_string(path)?.lines().map(str::trim).filter(|l| !l.is_empty()).map(ToOwned::to_owned).collect())
 }
 
 fn parse_channels(raw: &str) -> Vec<String> {
-    raw.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|line| {
-            if let Some(rest) = line.strip_prefix('@') {
-                return Some(rest.to_string());
-            }
-            if line.contains("t.me/") {
-                return line.split("t.me/").nth(1).map(|x| {
-                    x.split('?')
-                        .next()
-                        .unwrap_or_default()
-                        .trim_matches('/')
-                        .to_string()
-                });
-            }
-            Some(line.to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn channel_page_urls(channel: &str, before: Option<&str>) -> Vec<String> {
-    let mut urls = Vec::new();
-    for base in ["https://t.me/s", "https://telegram.me/s"] {
-        let mut url = format!("{base}/{channel}");
-        if let Some(id) = before {
-            url.push_str(&format!("?before={id}"));
-        }
-        urls.push(url);
-    }
-    urls
-}
-
-fn build_client(config: &AppConfig) -> Result<Client> {
-    let mut b = ClientBuilder::new()
-        .timeout(Duration::from_secs(20))
-        .connect_timeout(Duration::from_secs(10)) // جلوگیری از هنگ طولانی روی اتصال اولیه
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"); // مرورگر استاندارد برای جلوگیری از محدودیت‌های کلادفلر
-
-    match config.proxy_type {
-        ProxyType::None => {
-            b = b.no_proxy();
-        }
-        ProxyType::System => {
-            // reqwest به طور خودکار تنظیمات سیستم را اعمال می‌کند. 
-            // در ویندوز ممکن است نیاز به متغیرهای محیطی HTTP_PROXY باشد.
-        }
-        ProxyType::Http | ProxyType::Socks5 => {
-            if config.proxy_host.trim().is_empty() {
-                anyhow::bail!("Proxy host is required for HTTP/SOCKS5 proxy mode");
-            }
-            b = b.no_proxy(); // خاموش کردن پروکسی‌های پیش‌فرض تا تداخل ایجاد نکنند
-            let scheme = match config.proxy_type {
-                ProxyType::Http => "http",
-                ProxyType::Socks5 => "socks5h", // استفاده از socks5h بسیار مهم است (DNS Resolve سمت پروکسی)
-                _ => unreachable!(),
-            };
-            
-            let proxy_url = if config.proxy_username.trim().is_empty() {
-                format!("{}://{}:{}", scheme, config.proxy_host.trim(), config.proxy_port)
-            } else {
-                format!(
-                    "{}://{}:{}@{}:{}",
-                    scheme,
-                    url::form_urlencoded::byte_serialize(config.proxy_username.as_bytes()).collect::<String>(),
-                    url::form_urlencoded::byte_serialize(config.proxy_password.as_bytes()).collect::<String>(),
-                    config.proxy_host.trim(),
-                    config.proxy_port
-                )
-            };
-            
-            let proxy = reqwest::Proxy::all(&proxy_url)?;
-            b = b.proxy(proxy);
-        }
-    }
-
-    Ok(b.build()?)
-}
-
-fn build_fallback_client(config: &AppConfig) -> Result<Option<Client>> {
-    // اگر کاربر به صورت صریح پروکسی HTTP یا SOCKS5 تنظیم کرده است، هرگز نباید از 
-    // اتصال بدون پروکسی (Direct) به عنوان پشتیبان استفاده کنیم، چون در ایران منجر به Timeout قطعی می‌شود.
-    match config.proxy_type {
-        ProxyType::Http | ProxyType::Socks5 => Ok(None),
-        _ => {
-            let fallback = ClientBuilder::new()
-                .timeout(Duration::from_secs(20))
-                .connect_timeout(Duration::from_secs(10))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .no_proxy()
-                .build()?;
-            Ok(Some(fallback))
-        }
-    }
-}
-
-fn send_request_with_fallback(
-    primary: &Client,
-    fallback: Option<&Client>,
-    url: &str,
-) -> Result<reqwest::blocking::Response> {
-    match primary.get(url).send() {
-        Ok(resp) => Ok(resp),
-        Err(primary_err) => {
-            if let Some(fallback_client) = fallback {
-                match fallback_client.get(url).send() {
-                    Ok(resp) => Ok(resp),
-                    Err(fallback_err) => Err(anyhow::anyhow!(format!(
-                        "request failed (primary and fallback): primary=[{}]; fallback=[{}]",
-                        describe_reqwest_error(&primary_err),
-                        describe_reqwest_error(&fallback_err)
-                    ))),
-                }
-            } else {
-                Err(primary_err).context("request failed")
-            }
-        }
-    }
-}
-
-fn check_proxy_access(client: &Client, fallback: Option<&Client>, url: &str) -> Result<String> {
-    let resp = send_request_with_fallback(client, fallback, url)?;
-    let status = resp.status();
-    if status.is_success() || status.is_redirection() {
-        Ok(format!("status={status}"))
-    } else {
-        anyhow::bail!("status={status}")
-    }
-}
-
-fn describe_reqwest_error(err: &reqwest::Error) -> String {
-    let mut tags = Vec::new();
-    if err.is_connect() {
-        tags.push("connect");
-    }
-    if err.is_timeout() {
-        tags.push("timeout");
-    }
-    if err.is_request() {
-        tags.push("request");
-    }
-    if err.is_status() {
-        tags.push("status");
-    }
-
-    let kind = if tags.is_empty() {
-        "unknown".to_string()
-    } else {
-        tags.join("+")
-    };
-
-    let mut chain = Vec::new();
-    let mut src = err.source();
-    while let Some(s) = src {
-        chain.push(s.to_string());
-        src = s.source();
-    }
-
-    let chain_text = if chain.is_empty() {
-        "no-source".to_string()
-    } else {
-        chain.join(" -> ")
-    };
-
-    let url = err
-        .url()
-        .map(|u| u.as_str().to_string())
-        .unwrap_or_else(|| "n/a".to_string());
-
-    format!("kind={kind}; url={url}; msg={err}; source={chain_text}")
+    raw.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).filter_map(|line| {
+        if let Some(rest) = line.strip_prefix('@') { return Some(rest.to_string()); }
+        if line.contains("t.me/") { return line.split("t.me/").nth(1).map(|x| x.split('?').next().unwrap_or_default().trim_matches('/').to_string()); }
+        Some(line.to_string())
+    }).filter(|s| !s.is_empty()).collect()
 }
 
 fn build_protocol_regex() -> Result<Regex> {
@@ -1007,28 +815,8 @@ fn save_channels(body: &str) -> Result<()> {
     Ok(())
 }
 
-fn log_event(tx: &Sender<WorkerEvent>, msg: String) {
-    let line = format!("[{}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
-    let _ = append_log(&line);
-    let _ = tx.send(WorkerEvent::Log(line));
-}
-
-fn append_log(line: &str) -> Result<()> {
-    use std::io::Write;
-    ensure_parent(LOG_FILE)?;
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(LOG_FILE)?;
-    writeln!(f, "{line}")?;
-    Ok(())
-}
-
 fn ensure_parent(path: &str) -> Result<()> {
-    let parent: PathBuf = Path::new(path)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let parent: PathBuf = Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(parent)?;
     Ok(())
 }
