@@ -16,7 +16,8 @@ use std::time::Duration;
 
 const APP_CONFIG_PATH: &str = "config/app_config.toml";
 const CHANNELS_PATH: &str = "config/channels.txt";
-const OUTPUT_DIR: &str = "output";
+const OUTPUT_NEW_DIR: &str = "output/new_only";
+const OUTPUT_APPEND_DIR: &str = "output/append_unique";
 const LOG_FILE: &str = "logs/app.log";
 const HISTORY_PATH: &str = "output/sent_history.json";
 const DEFAULT_PROTOCOLS: [&str; 27] = [
@@ -51,55 +52,10 @@ const DEFAULT_PROTOCOLS: [&str; 27] = [
 
 fn main() {
     let _ = eframe::run_native(
-        "جمع‌آوری کانفیگ تلگرام",
+        "Telegram Config Collector",
         eframe::NativeOptions::default(),
-        Box::new(|cc| {
-            configure_persian_font(&cc.egui_ctx);
-            Ok(Box::new(AppState::bootstrap()))
-        }),
+        Box::new(|_| Ok(Box::new(AppState::bootstrap()))),
     );
-}
-
-fn configure_persian_font(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    if let Some(font_bytes) = load_persian_font_bytes() {
-        fonts.font_data.insert(
-            "persian_font".to_owned(),
-            egui::FontData::from_owned(font_bytes).into(),
-        );
-
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "persian_font".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("persian_font".to_owned());
-    }
-
-    ctx.set_fonts(fonts);
-}
-
-fn load_persian_font_bytes() -> Option<Vec<u8>> {
-    let candidates = [
-        r"C:\Windows\Fonts\tahoma.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\segoeui.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
-    ];
-
-    for path in candidates {
-        if let Ok(bytes) = fs::read(path) {
-            return Some(bytes);
-        }
-    }
-
-    None
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,29 +65,26 @@ struct ProtocolRule {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-enum Language {
-    Fa,
-    En,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 enum ProxyType {
     None,
+    System,
     Http,
     Socks5,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct AppConfig {
     interval_minutes: u64,
     max_pages_per_channel: usize,
     lookback_days: i64,
-    language: Language,
     proxy_type: ProxyType,
     proxy_host: String,
     proxy_port: u16,
     proxy_username: String,
     proxy_password: String,
+    output_new_only_enabled: bool,
+    output_append_unique_enabled: bool,
     protocol_rules: BTreeMap<String, ProtocolRule>,
 }
 
@@ -151,12 +104,13 @@ impl Default for AppConfig {
             interval_minutes: 5,
             max_pages_per_channel: 8,
             lookback_days: 1,
-            language: Language::Fa,
             proxy_type: ProxyType::None,
             proxy_host: String::new(),
             proxy_port: 1080,
             proxy_username: String::new(),
             proxy_password: String::new(),
+            output_new_only_enabled: true,
+            output_append_unique_enabled: false,
             protocol_rules,
         }
     }
@@ -242,9 +196,9 @@ impl AppState {
         Self {
             config: AppConfig::load_or_create(),
             channels_text: fs::read_to_string(CHANNELS_PATH).unwrap_or_else(|_| {
-                "# هر خط یک کانال\n# @channel\n# https://t.me/channel".to_string()
+                "# one channel per line\n# @channel\n# https://t.me/channel".to_string()
             }),
-            logs: vec!["برنامه آماده اجرا است.".to_string()],
+            logs: vec!["Application is ready.".to_string()],
             total_configs: 0,
             by_protocol: BTreeMap::new(),
             running: false,
@@ -259,7 +213,7 @@ impl AppState {
             return;
         }
         if let Err(e) = save_channels(&self.channels_text).and_then(|_| self.config.save()) {
-            self.logs.push(format!("خطا در ذخیره تنظیمات: {e:#}"));
+            self.logs.push(format!("Failed to save settings: {e:#}"));
             return;
         }
 
@@ -273,7 +227,7 @@ impl AppState {
 
         self.worker_handle = Some(thread::spawn(move || {
             if let Err(err) = run_worker(cfg, channels_raw, stop_flag, tx.clone()) {
-                let _ = tx.send(WorkerEvent::Log(format!("خطای بحرانی: {err:#}")));
+                let _ = tx.send(WorkerEvent::Log(format!("Critical error: {err:#}")));
             }
         }));
     }
@@ -281,7 +235,7 @@ impl AppState {
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.running = false;
-        self.logs.push("درخواست توقف ثبت شد.".to_string());
+        self.logs.push("Stop requested.".to_string());
     }
 
     fn poll_events(&mut self) {
@@ -307,87 +261,43 @@ impl AppState {
     }
 }
 
-impl AppState {
-    fn tr(&self, fa: &str, en: &str) -> String {
-        match self.config.language {
-            Language::Fa => shape_rtl_text(fa),
-            Language::En => en.to_string(),
-        }
-    }
-
-    fn rtl(&self) -> bool {
-        matches!(self.config.language, Language::Fa)
-    }
-}
-
-fn shape_rtl_text(input: &str) -> String {
-    input.chars().rev().collect()
-}
-
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.heading(self.tr(
-                "🛰️ جمع‌آوری هوشمند کانفیگ تلگرام",
-                "🛰️ Telegram Config Collector",
-            ));
+            ui.heading("🛰️ Telegram Config Collector");
         });
 
         egui::SidePanel::left("left")
             .min_width(360.0)
             .show(ctx, |ui| {
-                let layout = if self.rtl() {
-                    egui::Layout::right_to_left(egui::Align::TOP)
-                } else {
-                    egui::Layout::left_to_right(egui::Align::TOP)
-                };
-                ui.with_layout(layout, |ui| {
-                    ui.heading(self.tr("تنظیمات اصلی", "Main Settings"));
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                    ui.heading("Main Settings");
                     ui.horizontal(|ui| {
-                        ui.label(self.tr("زبان رابط:", "UI Language:"));
-                        egui::ComboBox::from_id_source("language")
-                            .selected_text(match self.config.language {
-                                Language::Fa => self.tr("فارسی", "Persian"),
-                                Language::En => "English".to_string(),
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.config.language,
-                                    Language::Fa,
-                                    self.tr("فارسی", "Persian"),
-                                );
-                                ui.selectable_value(
-                                    &mut self.config.language,
-                                    Language::En,
-                                    "English",
-                                );
-                            });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(&self.tr("هر چند دقیقه چک شود:", "Check interval (minutes):"));
+                        ui.label("Check interval (minutes):");
                         ui.add(
                             egui::DragValue::new(&mut self.config.interval_minutes).range(1..=240),
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label(&self.tr("حداکثر صفحات هر کانال:", "Max pages per channel:"));
+                        ui.label("Max pages per channel:");
                         ui.add(
                             egui::DragValue::new(&mut self.config.max_pages_per_channel)
                                 .range(1..=100),
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label(&self.tr("بررسی پیام‌های چند روز اخیر:", "Look back days:"));
+                        ui.label("Look back days:");
                         ui.add(egui::DragValue::new(&mut self.config.lookback_days).range(1..=30));
                     });
 
                     ui.separator();
-                    ui.heading(&self.tr("پروکسی", "Proxy"));
-                    egui::ComboBox::from_label(self.tr("نوع", "Type"))
+                    ui.heading("Proxy");
+                    egui::ComboBox::from_label("Type")
                         .selected_text(match self.config.proxy_type {
-                            ProxyType::None => self.tr("بدون پروکسی", "No proxy"),
+                            ProxyType::None => "No proxy",
+                            ProxyType::System => "System proxy",
                             ProxyType::Http => "HTTP",
                             ProxyType::Socks5 => "SOCKS5",
                         })
@@ -395,7 +305,12 @@ impl eframe::App for AppState {
                             ui.selectable_value(
                                 &mut self.config.proxy_type,
                                 ProxyType::None,
-                                self.tr("بدون پروکسی", "No proxy"),
+                                "No proxy",
+                            );
+                            ui.selectable_value(
+                                &mut self.config.proxy_type,
+                                ProxyType::System,
+                                "System proxy",
                             );
                             ui.selectable_value(
                                 &mut self.config.proxy_type,
@@ -408,59 +323,61 @@ impl eframe::App for AppState {
                                 "SOCKS5",
                             );
                         });
-                    ui.label(&self.tr("هاست پروکسی", "Proxy host"));
-                    ui.text_edit_singleline(&mut self.config.proxy_host);
-                    ui.horizontal(|ui| {
-                        ui.label(&self.tr("پورت", "Port"));
-                        ui.add(egui::DragValue::new(&mut self.config.proxy_port).range(1..=65535));
-                    });
-                    ui.label(&self.tr("یوزرنیم (اختیاری)", "Username (optional)"));
-                    ui.text_edit_singleline(&mut self.config.proxy_username);
-                    ui.label(&self.tr("پسورد (اختیاری)", "Password (optional)"));
-                    ui.text_edit_singleline(&mut self.config.proxy_password);
+                    let custom_proxy =
+                        matches!(self.config.proxy_type, ProxyType::Http | ProxyType::Socks5);
+                    if custom_proxy {
+                        ui.label("Proxy host");
+                        ui.text_edit_singleline(&mut self.config.proxy_host);
+                        ui.horizontal(|ui| {
+                            ui.label("Port");
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.proxy_port).range(1..=65535),
+                            );
+                        });
+                        ui.label("Username (optional)");
+                        ui.text_edit_singleline(&mut self.config.proxy_username);
+                        ui.label("Password (optional)");
+                        ui.text_edit_singleline(&mut self.config.proxy_password);
+                    }
 
                     ui.separator();
-                    ui.heading(&self.tr(
-                        "پروتکل‌ها (فعال/غیرفعال + سقف تعداد)",
-                        "Protocols (Enable/Disable + Limit)",
-                    ));
+                    ui.heading("Output modes");
+                    ui.checkbox(
+                        &mut self.config.output_new_only_enabled,
+                        "Replace with new-only output (output/new_only)",
+                    );
+                    ui.checkbox(
+                        &mut self.config.output_append_unique_enabled,
+                        "Append unique output (output/append_unique)",
+                    );
+
+                    ui.separator();
+                    ui.heading("Protocols (Enable/Disable + Limit)");
                     for (name, rule) in &mut self.config.protocol_rules {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut rule.enabled, name);
-                            ui.label(&self.tr("حداکثر:", "Max:"));
+                            ui.label("Max:");
                             ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000));
                         });
                     }
 
                     ui.separator();
-                    if ui
-                        .button(
-                            &self.tr("💾 ذخیره کانال‌ها و تنظیمات", "💾 Save channels & settings"),
-                        )
-                        .clicked()
-                    {
+                    if ui.button("💾 Save channels & settings").clicked() {
                         match save_channels(&self.channels_text).and_then(|_| self.config.save()) {
-                            Ok(_) => self.logs.push("تنظیمات ذخیره شد.".to_string()),
-                            Err(e) => self.logs.push(format!("خطا در ذخیره: {e:#}")),
+                            Ok(_) => self.logs.push("Settings saved.".to_string()),
+                            Err(e) => self.logs.push(format!("Save failed: {e:#}")),
                         }
                     }
                     if !self.running {
-                        if ui.button(&self.tr("▶️ شروع", "▶️ Start")).clicked() {
+                        if ui.button("▶️ Start").clicked() {
                             self.start();
                         }
-                    } else if ui.button(&self.tr("⏹ توقف", "⏹ Stop")).clicked() {
+                    } else if ui.button("⏹ Stop").clicked() {
                         self.stop();
                     }
 
                     ui.separator();
-                    ui.label(match self.config.language {
-                        Language::Fa => format!(
-                            "{} :{}",
-                            self.tr("مجموع جدیدها", "Total new"),
-                            self.total_configs
-                        ),
-                        Language::En => format!("Total new: {}", self.total_configs),
-                    });
+                    ui.label(format!("Total new: {}", self.total_configs));
                     for (k, v) in &self.by_protocol {
                         ui.label(format!("{k}: {v}"));
                     }
@@ -468,31 +385,19 @@ impl eframe::App for AppState {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let layout = if self.rtl() {
-                egui::Layout::right_to_left(egui::Align::TOP)
-            } else {
-                egui::Layout::left_to_right(egui::Align::TOP)
-            };
-            ui.with_layout(layout, |ui| {
-                ui.heading(&self.tr(
-                    "لیست کانال‌ها (هر خط یک کانال)",
-                    "Channels list (one per line)",
-                ));
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                ui.heading("Channels list (one per line)");
                 ui.add_sized(
                     [ui.available_width(), 180.0],
                     egui::TextEdit::multiline(&mut self.channels_text),
                 );
                 ui.separator();
-                ui.heading(&self.tr("لاگ حرفه‌ای", "Professional logs"));
+                ui.heading("Professional logs");
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         for line in self.logs.iter().rev().take(300).rev() {
-                            if self.rtl() {
-                                ui.label(shape_rtl_text(line));
-                            } else {
-                                ui.label(line);
-                            }
+                            ui.label(line);
                         }
                     });
             });
@@ -510,7 +415,9 @@ fn run_worker(
 ) -> Result<()> {
     let channels = parse_channels(&channels_raw);
     if channels.is_empty() {
-        let _ = tx.send(WorkerEvent::Log("کانال معتبری ثبت نشده است.".to_string()));
+        let _ = tx.send(WorkerEvent::Log(
+            "No valid channels were provided.".to_string(),
+        ));
         return Ok(());
     }
 
@@ -520,7 +427,7 @@ fn run_worker(
 
     loop {
         if stop.load(Ordering::SeqCst) {
-            log_event(&tx, "Worker متوقف شد.".to_string());
+            log_event(&tx, "Worker stopped.".to_string());
             break;
         }
 
@@ -529,7 +436,7 @@ fn run_worker(
         let mut gathered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         for channel in &channels {
-            log_event(&tx, format!("پردازش @{channel}"));
+            log_event(&tx, format!("Processing @{channel}"));
             let result = fetch_channel_configs(
                 &client,
                 channel,
@@ -544,7 +451,7 @@ fn run_worker(
                         gathered.entry(p).or_default().extend(links);
                     }
                 }
-                Err(e) => log_event(&tx, format!("خطا در @{channel}: {e:#}")),
+                Err(e) => log_event(&tx, format!("Error on @{channel}: {e:#}")),
             }
             thread::sleep(Duration::from_millis(700));
         }
@@ -560,7 +467,18 @@ fn run_worker(
         }
 
         apply_protocol_limits(&mut new_only, &config.protocol_rules);
-        write_outputs(&new_only)?;
+        if config.output_new_only_enabled {
+            write_outputs_replace(OUTPUT_NEW_DIR, &new_only)?;
+        }
+        if config.output_append_unique_enabled {
+            write_outputs_append_unique(OUTPUT_APPEND_DIR, &new_only)?;
+        }
+        if !config.output_new_only_enabled && !config.output_append_unique_enabled {
+            log_event(
+                &tx,
+                "No output mode enabled; skipping file writes.".to_string(),
+            );
+        }
         history.prune(config.lookback_days);
         history.save()?;
 
@@ -571,7 +489,7 @@ fn run_worker(
             total += v.len();
         }
         let _ = tx.send(WorkerEvent::Stats { total, by_protocol });
-        log_event(&tx, format!("تکمیل شد. تعداد کانفیگ جدید: {total}"));
+        log_event(&tx, format!("Completed. New configs found: {total}"));
 
         for _ in 0..(config.interval_minutes * 60) {
             if stop.load(Ordering::SeqCst) {
@@ -604,7 +522,7 @@ fn fetch_channel_configs(
             url.push_str(&format!("?before={id}"));
         }
 
-        let resp = client.get(&url).send().context("ارسال درخواست")?;
+        let resp = client.get(&url).send().context("request failed")?;
         if !resp.status().is_success() {
             anyhow::bail!("status={}", resp.status());
         }
@@ -677,19 +595,57 @@ fn apply_protocol_limits(
     }
 }
 
-fn write_outputs(store: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
-    fs::create_dir_all(OUTPUT_DIR)?;
+fn write_outputs_replace(base_dir: &str, store: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
+    fs::create_dir_all(base_dir)?;
     let mut mixed = Vec::new();
     for (p, links) in store {
         let lines: Vec<String> = links.iter().cloned().collect();
         fs::write(
-            Path::new(OUTPUT_DIR).join(format!("{p}.txt")),
+            Path::new(base_dir).join(format!("{p}.txt")),
             lines.join("\n"),
         )?;
         mixed.extend(lines);
     }
-    fs::write(Path::new(OUTPUT_DIR).join("mixed.txt"), mixed.join("\n"))?;
+    fs::write(Path::new(base_dir).join("mixed.txt"), mixed.join("\n"))?;
     Ok(())
+}
+
+fn write_outputs_append_unique(
+    base_dir: &str,
+    store: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<()> {
+    fs::create_dir_all(base_dir)?;
+
+    for (p, links) in store {
+        let path = Path::new(base_dir).join(format!("{p}.txt"));
+        let mut combined = read_existing_set(&path)?;
+        combined.extend(links.iter().cloned());
+        let lines: Vec<String> = combined.into_iter().collect();
+        fs::write(&path, lines.join("\n"))?;
+    }
+
+    let mixed_path = Path::new(base_dir).join("mixed.txt");
+    let mut mixed = read_existing_set(&mixed_path)?;
+    for links in store.values() {
+        mixed.extend(links.iter().cloned());
+    }
+    let mixed_lines: Vec<String> = mixed.into_iter().collect();
+    fs::write(mixed_path, mixed_lines.join("\n"))?;
+
+    Ok(())
+}
+
+fn read_existing_set(path: &Path) -> Result<BTreeSet<String>> {
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 fn parse_channels(raw: &str) -> Vec<String> {
@@ -719,31 +675,43 @@ fn build_client(config: &AppConfig) -> Result<Client> {
     let mut b = ClientBuilder::new()
         .timeout(Duration::from_secs(25))
         .user_agent("Mozilla/5.0 ConfigCollectorWindows/1.1");
-    if config.proxy_type != ProxyType::None && !config.proxy_host.trim().is_empty() {
-        let scheme = match config.proxy_type {
-            ProxyType::Http => "http",
-            ProxyType::Socks5 => "socks5h",
-            ProxyType::None => "",
-        };
-        let proxy = if config.proxy_username.trim().is_empty() {
-            format!(
-                "{scheme}://{}:{}",
-                config.proxy_host.trim(),
-                config.proxy_port
-            )
-        } else {
-            format!(
-                "{scheme}://{}:{}@{}:{}",
-                url::form_urlencoded::byte_serialize(config.proxy_username.as_bytes())
-                    .collect::<String>(),
-                url::form_urlencoded::byte_serialize(config.proxy_password.as_bytes())
-                    .collect::<String>(),
-                config.proxy_host.trim(),
-                config.proxy_port
-            )
-        };
-        b = b.proxy(reqwest::Proxy::all(&proxy)?);
+
+    match config.proxy_type {
+        ProxyType::None => {
+            b = b.no_proxy();
+        }
+        ProxyType::System => {}
+        ProxyType::Http | ProxyType::Socks5 => {
+            if config.proxy_host.trim().is_empty() {
+                anyhow::bail!("Proxy host is required for HTTP/SOCKS5 proxy mode");
+            }
+            b = b.no_proxy();
+            let scheme = match config.proxy_type {
+                ProxyType::Http => "http",
+                ProxyType::Socks5 => "socks5h",
+                ProxyType::None | ProxyType::System => unreachable!(),
+            };
+            let proxy = if config.proxy_username.trim().is_empty() {
+                format!(
+                    "{scheme}://{}:{}",
+                    config.proxy_host.trim(),
+                    config.proxy_port
+                )
+            } else {
+                format!(
+                    "{scheme}://{}:{}@{}:{}",
+                    url::form_urlencoded::byte_serialize(config.proxy_username.as_bytes())
+                        .collect::<String>(),
+                    url::form_urlencoded::byte_serialize(config.proxy_password.as_bytes())
+                        .collect::<String>(),
+                    config.proxy_host.trim(),
+                    config.proxy_port
+                )
+            };
+            b = b.proxy(reqwest::Proxy::all(&proxy)?);
+        }
     }
+
     Ok(b.build()?)
 }
 
