@@ -307,13 +307,6 @@ impl eframe::App for AppState {
                     ui.label(
                         egui::RichText::new(format!("Total new: {}", self.total_configs)).strong(),
                     );
-                    ui.separator();
-                    let proxy_color = match self.proxy_access_ok {
-                        Some(true) => egui::Color32::from_rgb(90, 200, 120),
-                        Some(false) => egui::Color32::from_rgb(232, 92, 92),
-                        None => egui::Color32::from_rgb(180, 180, 180),
-                    };
-                    ui.label(egui::RichText::new(&self.proxy_access_status).color(proxy_color));
 
                     if !self.running {
                         if ui
@@ -353,6 +346,21 @@ impl eframe::App for AppState {
                         ctx.output_mut(|o| o.copied_text = all_logs);
                         self.logs.push("Logs copied to clipboard.".to_string());
                     }
+                });
+            });
+
+        egui::TopBottomPanel::top("proxy_status")
+            .exact_height(28.0)
+            .show(ctx, |ui| {
+                let proxy_color = match self.proxy_access_ok {
+                    Some(true) => egui::Color32::from_rgb(90, 200, 120),
+                    Some(false) => egui::Color32::from_rgb(232, 92, 92),
+                    None => egui::Color32::from_rgb(180, 180, 180),
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("●").color(proxy_color).strong());
+                    ui.label(egui::RichText::new(&self.proxy_access_status).color(proxy_color));
+                    ui.label("(details are in logs)");
                 });
             });
 
@@ -555,7 +563,7 @@ fn run_worker(
         Ok(detail) => {
             let _ = tx.send(WorkerEvent::ProxyAccess {
                 ok: true,
-                detail: format!("Proxy access: OK ({detail})"),
+                detail: "Proxy access to web.telegram.org: OK".to_string(),
             });
             log_event(
                 &tx,
@@ -563,7 +571,7 @@ fn run_worker(
             );
         }
         Err(e) => {
-            let msg = format!("Proxy access: FAILED ({e})");
+            let msg = "Proxy access to web.telegram.org: FAILED".to_string();
             let _ = tx.send(WorkerEvent::ProxyAccess {
                 ok: false,
                 detail: msg.clone(),
@@ -669,12 +677,26 @@ fn fetch_channel_configs(
     let mut before: Option<String> = None;
 
     for _ in 0..max_pages {
-        let mut url = format!("https://t.me/s/{channel}");
-        if let Some(id) = &before {
-            url.push_str(&format!("?before={id}"));
+        let urls = channel_page_urls(channel, before.as_deref());
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut resp_opt = None;
+        for url in &urls {
+            match send_request_with_fallback(client, fallback_client, url) {
+                Ok(resp) => {
+                    resp_opt = Some(resp);
+                    break;
+                }
+                Err(e) => last_err = Some(anyhow::anyhow!("{url}: {e}")),
+            }
         }
-
-        let resp = send_request_with_fallback(client, fallback_client, &url)?;
+        let resp = match resp_opt {
+            Some(r) => r,
+            None => {
+                return Err(
+                    last_err.unwrap_or_else(|| anyhow::anyhow!("all channel URL attempts failed"))
+                )
+            }
+        };
         if !resp.status().is_success() {
             anyhow::bail!("status={}", resp.status());
         }
@@ -821,6 +843,18 @@ fn parse_channels(raw: &str) -> Vec<String> {
         })
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+fn channel_page_urls(channel: &str, before: Option<&str>) -> Vec<String> {
+    let mut urls = Vec::new();
+    for base in ["https://t.me/s", "https://telegram.me/s"] {
+        let mut url = format!("{base}/{channel}");
+        if let Some(id) = before {
+            url.push_str(&format!("?before={id}"));
+        }
+        urls.push(url);
+    }
+    urls
 }
 
 fn build_client(config: &AppConfig) -> Result<Client> {
