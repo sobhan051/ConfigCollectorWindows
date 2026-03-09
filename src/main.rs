@@ -182,6 +182,7 @@ enum WorkerEvent {
 struct AppState {
     config: AppConfig,
     channels_text: String,
+    show_channels_editor: bool,
     logs: Vec<String>,
     total_configs: usize,
     by_protocol: BTreeMap<String, usize>,
@@ -198,6 +199,7 @@ impl AppState {
             channels_text: fs::read_to_string(CHANNELS_PATH).unwrap_or_else(|_| {
                 "# one channel per line\n# @channel\n# https://t.me/channel".to_string()
             }),
+            show_channels_editor: true,
             logs: vec!["Application is ready.".to_string()],
             total_configs: 0,
             by_protocol: BTreeMap::new(),
@@ -315,6 +317,21 @@ impl eframe::App for AppState {
                             Ok(_) => self.logs.push("Settings saved.".to_string()),
                             Err(e) => self.logs.push(format!("Save failed: {e:#}")),
                         }
+                    }
+
+                    let channels_btn = if self.show_channels_editor {
+                        "Hide Channels"
+                    } else {
+                        "Show Channels"
+                    };
+                    if ui.button(channels_btn).clicked() {
+                        self.show_channels_editor = !self.show_channels_editor;
+                    }
+
+                    if ui.button("📋 Copy Logs").clicked() {
+                        let all_logs = self.logs.join("\n");
+                        ctx.output_mut(|o| o.copied_text = all_logs);
+                        self.logs.push("Logs copied to clipboard.".to_string());
                     }
                 });
             });
@@ -435,37 +452,49 @@ impl eframe::App for AppState {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.columns(2, |columns| {
-                columns[0].group(|ui| {
-                    ui.heading("Channels");
-                    ui.label("One channel per line (@channel or https://t.me/channel)");
-                    ui.add_space(4.0);
-                    ui.add_sized(
-                        [ui.available_width(), ui.available_height() - 12.0],
-                        egui::TextEdit::multiline(&mut self.channels_text),
-                    );
-                });
+            if self.show_channels_editor {
+                ui.columns(2, |columns| {
+                    columns[0].group(|ui| {
+                        ui.heading("Channels");
+                        ui.label("One channel per line (@channel or https://t.me/channel)");
+                        ui.add_space(4.0);
+                        ui.add_sized(
+                            [ui.available_width(), ui.available_height() - 12.0],
+                            egui::TextEdit::multiline(&mut self.channels_text),
+                        );
+                    });
 
-                columns[1].group(|ui| {
-                    ui.heading("Live Logs");
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for line in self.logs.iter().rev().take(400).rev() {
-                                ui.label(line);
-                            }
-                        });
-                    ui.separator();
-                    ui.heading("By protocol");
-                    for (k, v) in &self.by_protocol {
-                        ui.label(format!("{k}: {v}"));
-                    }
+                    render_logs_and_stats(&self.logs, &self.by_protocol, &mut columns[1]);
                 });
-            });
+            } else {
+                ui.group(|ui| {
+                    render_logs_and_stats(&self.logs, &self.by_protocol, ui);
+                });
+            }
         });
 
         ctx.request_repaint_after(Duration::from_millis(200));
+    }
+}
+
+fn render_logs_and_stats(
+    logs: &[String],
+    by_protocol: &BTreeMap<String, usize>,
+    ui: &mut egui::Ui,
+) {
+    ui.heading("Live Logs");
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for line in logs.iter().rev().take(400).rev() {
+                ui.label(line);
+            }
+        });
+    ui.separator();
+    ui.heading("By protocol");
+    for (k, v) in by_protocol {
+        ui.label(format!("{k}: {v}"));
     }
 }
 
@@ -484,8 +513,22 @@ fn run_worker(
     }
 
     let client = build_client(&config)?;
+    let fallback_client = build_fallback_client(&config)?;
     let regex = build_protocol_regex()?;
     let mut history = SentHistory::load();
+
+    log_event(
+        &tx,
+        format!(
+            "Proxy mode: {}",
+            match config.proxy_type {
+                ProxyType::None => "No proxy",
+                ProxyType::System => "System proxy",
+                ProxyType::Http => "HTTP",
+                ProxyType::Socks5 => "SOCKS5",
+            }
+        ),
+    );
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -501,6 +544,7 @@ fn run_worker(
             log_event(&tx, format!("Processing @{channel}"));
             let result = fetch_channel_configs(
                 &client,
+                fallback_client.as_ref(),
                 channel,
                 config.max_pages_per_channel,
                 threshold,
@@ -565,6 +609,7 @@ fn run_worker(
 
 fn fetch_channel_configs(
     client: &Client,
+    fallback_client: Option<&Client>,
     channel: &str,
     max_pages: usize,
     threshold: DateTime<Utc>,
@@ -584,7 +629,7 @@ fn fetch_channel_configs(
             url.push_str(&format!("?before={id}"));
         }
 
-        let resp = client.get(&url).send().context("request failed")?;
+        let resp = send_request_with_fallback(client, fallback_client, &url)?;
         if !resp.status().is_success() {
             anyhow::bail!("status={}", resp.status());
         }
@@ -775,6 +820,44 @@ fn build_client(config: &AppConfig) -> Result<Client> {
     }
 
     Ok(b.build()?)
+}
+
+fn build_fallback_client(config: &AppConfig) -> Result<Option<Client>> {
+    let fallback_builder = || {
+        ClientBuilder::new()
+            .timeout(Duration::from_secs(25))
+            .user_agent("Mozilla/5.0 ConfigCollectorWindows/1.1")
+    };
+
+    let fallback = match config.proxy_type {
+        ProxyType::None => Some(fallback_builder().build()?),
+        ProxyType::System => Some(fallback_builder().no_proxy().build()?),
+        ProxyType::Http | ProxyType::Socks5 => Some(fallback_builder().no_proxy().build()?),
+    };
+
+    Ok(fallback)
+}
+
+fn send_request_with_fallback(
+    primary: &Client,
+    fallback: Option<&Client>,
+    url: &str,
+) -> Result<reqwest::blocking::Response> {
+    match primary.get(url).send() {
+        Ok(resp) => Ok(resp),
+        Err(primary_err) => {
+            if let Some(fallback_client) = fallback {
+                match fallback_client.get(url).send() {
+                    Ok(resp) => Ok(resp),
+                    Err(fallback_err) => Err(anyhow::anyhow!(
+                        "request failed (primary and fallback): primary={primary_err}; fallback={fallback_err}"
+                    )),
+                }
+            } else {
+                Err(primary_err).context("request failed")
+            }
+        }
+    }
 }
 
 fn build_protocol_regex() -> Result<Regex> {
