@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use eframe::egui;
 use regex::Regex;
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -118,7 +118,9 @@ impl AppConfig {
         let cfg = Self::default(); let _ = cfg.save(); cfg
     }
     fn save(&self) -> Result<()> {
-        fs::create_dir_all(Path::new(APP_CONFIG_PATH).parent().unwrap())?;
+        if let Some(parent) = Path::new(APP_CONFIG_PATH).parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(APP_CONFIG_PATH, toml::to_string_pretty(self)?)?;
         Ok(())
     }
@@ -126,13 +128,25 @@ impl AppConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SentHistory { sent_at: BTreeMap<String, DateTime<Utc>> }
+
 impl SentHistory {
     fn load() -> Self {
-        if let Ok(raw) = fs::read_to_string(HISTORY_PATH) { if let Ok(v) = serde_json::from_str::<Self>(&raw) { return v; } }
+        if let Ok(raw) = fs::read_to_string(HISTORY_PATH) { 
+            if let Ok(v) = serde_json::from_str::<Self>(&raw) { return v; } 
+        }
         Self::default()
     }
+    
+    // تابع مهمی که قبلا جا افتاده بود و باعث ارور E0599 می‌شد
+    fn prune(&mut self, lookback_days: i64) {
+        let threshold = Utc::now() - ChronoDuration::days(lookback_days.max(1));
+        self.sent_at.retain(|_, ts| *ts >= threshold);
+    }
+    
     fn save(&self) -> Result<()> {
-        fs::create_dir_all(Path::new(HISTORY_PATH).parent().unwrap())?;
+        if let Some(parent) = Path::new(HISTORY_PATH).parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(HISTORY_PATH, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
@@ -259,7 +273,6 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        // Kill any lingering edge/chrome headless processes spawned by this app
         let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM msedge.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
         let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM chrome.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
     }
@@ -390,7 +403,7 @@ impl eframe::App for AppState {
 
 fn get_performance_settings(profile: &PerformanceProfile) -> (Duration, Duration) {
     match profile {
-        PerformanceProfile::WeakPC => (Duration::from_secs(4), Duration::from_secs(20)),  // 4s تاخیر بین صفحات، 20s مهلت
+        PerformanceProfile::WeakPC => (Duration::from_secs(4), Duration::from_secs(20)),  // 4s تاخیر، 20s مهلت
         PerformanceProfile::MediumPC => (Duration::from_secs(2), Duration::from_secs(15)), // 2s تاخیر، 15s مهلت
         PerformanceProfile::StrongPC => (Duration::from_secs(1), Duration::from_secs(10)), // 1s تاخیر، 10s مهلت
     }
@@ -414,7 +427,7 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         "--no-sandbox".to_string(),
         "--disable-extensions".to_string(),
         "--mute-audio".to_string(),
-        "--blink-settings=imagesEnabled=false".to_string(), // جلوگیری از لود عکس برای سرعت
+        "--blink-settings=imagesEnabled=false".to_string(), 
     ];
 
     match config.proxy_type {
@@ -442,14 +455,13 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         let start_time = Instant::now();
         let mut completed = false;
         
-        // Timeout Loop
         while start_time.elapsed() < timeout {
             if let Ok(Some(_)) = child.try_wait() { completed = true; break; }
             thread::sleep(Duration::from_millis(100));
         }
 
         if !completed {
-            let _ = child.kill(); // 🗡️ کشتن پروسه زامبی
+            let _ = child.kill(); 
             anyhow::bail!("Browser timeout exceeded ({}s). Process killed to save RAM.", timeout.as_secs());
         }
 
@@ -480,14 +492,14 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
 }
 
 // =============================================================
-// استخراج هوشمند (الهام گرفته از کد پایتون)
+// استخراج هوشمند و جمع آوری اطلاعات
 // =============================================================
 
 fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx: Sender<AppEvent>) -> Result<()> {
     let channels = parse_channels(&channels_raw);
     let (delay, _) = get_performance_settings(&config.performance);
     
-    // Regex قدرتمند و انعطاف‌پذیر
+    // Regex استخراج‌گر با حذف کاراکترهای اضافی (Bruteforce)
     let regex = Regex::new(r"(?i)(vmess|vless|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[a-zA-Z0-9\-\._~:/\?#\[\]@!\$&'\(\)\*\+,%;=]+").unwrap();
     let mut history = SentHistory::load();
 
@@ -518,7 +530,6 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
                         let mut found_in_page = 0;
                         let mut next_before = None;
                         
-                        // متد اول: CSS Selectors
                         let doc = Html::parse_document(&html);
                         let wrap_sel = Selector::parse("div.tgme_widget_message").unwrap();
                         let text_sel = Selector::parse("div.tgme_widget_message_text").unwrap();
@@ -538,7 +549,6 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
                             }
                         }
 
-                        // متد دوم: Bruteforce Regex (اگر CSS جواب نداد)
                         if !found_via_css {
                             for m in regex.find_iter(&html) {
                                 if let Some(proto) = m.as_str().split("://").next() {
@@ -552,17 +562,17 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
                             log_worker(&tx, LogLevel::Success, format!("    ✔️ Page {}: {} configs extracted.", page, found_in_page));
                         } else {
                             log_worker(&tx, LogLevel::Warning, format!("    ⚠️ Page {}: No configs found.", page));
-                            if next_before.is_none() { break; } // رسیدن به انتهای کانال
+                            if next_before.is_none() { break; } 
                         }
 
                         channel_configs += found_in_page;
                         before = next_before;
                     }
                     Err(e) => {
-                        log_worker(&tx, LogLevel::Error, format!("    ❌ Page {} failed: {}", page, e));
+                        log_worker(&tx, LogLevel::Error, format!("    ❌ Page {} failed: {}", page, extract_error_msg(&e)));
                     }
                 }
-                thread::sleep(delay); // استفاده از تاخیر بر اساس پروفایل سخت‌افزار
+                thread::sleep(delay); 
             }
             
             total_run_configs += channel_configs;
@@ -570,7 +580,6 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
             thread::sleep(Duration::from_secs(3));
         }
 
-        // پردازش تاریخچه و ذخیره‌سازی
         let mut new_only: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (proto, links) in gathered {
             for link in links {
@@ -601,6 +610,13 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
         }
     }
     Ok(())
+}
+
+fn extract_error_msg(err: &anyhow::Error) -> String {
+    let mut chain = Vec::new();
+    let mut current = Some(err.as_ref() as &dyn std::error::Error);
+    while let Some(e) = current { chain.push(e.to_string()); current = e.source(); }
+    chain.join(" -> ")
 }
 
 fn log_worker(tx: &Sender<AppEvent>, level: LogLevel, text: String) { let _ = tx.send(AppEvent::Log(level, text)); }
