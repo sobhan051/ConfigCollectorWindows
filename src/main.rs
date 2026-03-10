@@ -28,7 +28,7 @@ const OUTPUT_TESTED_DIR: &str = "output/tested_working";
 const HISTORY_PATH: &str = "output/sent_history.json";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const DEFAULT_PROTOCOLS: [&str; 27] =[
+const DEFAULT_PROTOCOLS:[&str; 27] =[
     "vmess", "vless", "trojan", "ss", "ssr", "tuic", "hysteria", "hysteria2", "hy2", "juicity",
     "snell", "anytls", "ssh", "wireguard", "wg", "warp", "socks", "socks4", "socks5", "tg", "dns",
     "nm-dns", "nm-vless", "slipnet-enc", "slipnet", "slipstream", "dnstt",
@@ -446,7 +446,7 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
 
     let outbound_settings = if is_vless {
         json!({
-            "vnext": [{
+            "vnext":[{
                 "address": host, "port": port,
                 "users":[{ "id": parsed.username(), "encryption": "none", "flow": flow }]
             }]
@@ -520,8 +520,8 @@ fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>) -> bool {
 fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx: Sender<AppEvent>) -> Result<()> {
     let channels = parse_channels(&channels_raw);
 
-    // 🔴 NEW STRICT REGEX: Extracts protocol:// followed by valid characters, stopping completely at Spaces, HTML tags < >, or quotes.
-    let regex_pattern = r"(?i)(vless|vmess|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[^\s<>`"'\\]+";
+    // 🔴 FIXED REGEX: Used the correct raw string syntax (r#"..."#) so quotes don't break the compiler.
+    let regex_pattern = r#"(?i)(vless|vmess|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[^\s<>`"'\\]+"#;
     let regex = Regex::new(regex_pattern).unwrap();
     let date_regex = Regex::new(r#"<time datetime="([^"]+)""#).unwrap();
 
