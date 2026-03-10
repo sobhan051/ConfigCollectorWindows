@@ -78,6 +78,7 @@ struct AppConfig {
     output_new_only_enabled: bool,
     output_append_unique_enabled: bool,
     test_configs_enabled: bool,
+    testing_timeout_seconds: u64, // NEW: User configurable tester timeout
     protocol_rules: BTreeMap<String, ProtocolRule>,
 }
 
@@ -86,10 +87,12 @@ impl Default for AppConfig {
         let mut protocol_rules = BTreeMap::new();
         for p in DEFAULT_PROTOCOLS { protocol_rules.insert(p.to_string(), ProtocolRule { enabled: true, max_count: 500 }); }
         Self {
-            interval_minutes: 15, max_pages_per_channel: 5, lookback_days: 2, engine: ScrapingEngine::Reqwest,
+            interval_minutes: 15, max_pages_per_channel: 2, lookback_days: 2, engine: ScrapingEngine::Reqwest,
             proxy_type: ProxyType::Http, proxy_host: "127.0.0.1".to_string(), proxy_port: 10880,
             performance: PerformanceProfile::MediumPC, ignore_ssl_errors: true, remote_dns: true,
-            output_new_only_enabled: true, output_append_unique_enabled: true, test_configs_enabled: true, protocol_rules,
+            output_new_only_enabled: true, output_append_unique_enabled: true, test_configs_enabled: true, 
+            testing_timeout_seconds: 35, // Default test timeout
+            protocol_rules,
         }
     }
 }
@@ -98,6 +101,7 @@ impl AppConfig {
     fn load_or_create() -> Self {
         if let Ok(raw) = fs::read_to_string(APP_CONFIG_PATH) {
             if let Ok(mut cfg) = toml::from_str::<Self>(&raw) {
+                if cfg.testing_timeout_seconds == 0 { cfg.testing_timeout_seconds = 35; }
                 for p in DEFAULT_PROTOCOLS { cfg.protocol_rules.entry(p.to_string()).or_insert(ProtocolRule { enabled: true, max_count: 500 }); }
                 return cfg;
             }
@@ -292,6 +296,12 @@ impl eframe::App for AppState {
                         ui.checkbox(&mut self.config.output_new_only_enabled, "Extract New Configs Only");
                         ui.checkbox(&mut self.config.output_append_unique_enabled, "Backup All Unique Configs");
                         ui.checkbox(&mut self.config.test_configs_enabled, "✅ Enable Isolated Xray Tester");
+                        
+                        // NEW GUI Setting for user test timeout
+                        ui.horizontal(|ui| { 
+                            ui.label("Test Timeout (Sec):"); 
+                            ui.add(egui::DragValue::new(&mut self.config.testing_timeout_seconds).clamp_range(10..=300)); 
+                        });
                     }
                     1 => {
                         ui.heading(egui::RichText::new("📡 Target Channels").color(egui::Color32::LIGHT_BLUE));
@@ -385,7 +395,7 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
 
         let start_time = Instant::now(); let mut stdout_str = String::new(); let mut is_completed = false;
         if let Some(mut stdout) = child_proc.stdout.take() {
-            let mut buffer = [0; 4096];
+            let mut buffer =[0; 4096];
             loop {
                 if start_time.elapsed().as_millis() as u64 > timeout_ms { break; }
                 match stdout.read(&mut buffer) {
@@ -482,7 +492,7 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
     Some(serde_json::to_string_pretty(&xray_config).unwrap())
 }
 
-fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>) -> bool {
+fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>, timeout_secs: u64) -> bool {
     let test_port = 10090;
     let json_config = match generate_xray_json(config_link, test_port) {
         Some(c) => c, None => return false,
@@ -504,7 +514,7 @@ fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>) -> bool {
     let proxy_url = format!("socks5h://127.0.0.1:{}", test_port);
     let result = reqwest::blocking::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
-        .timeout(Duration::from_secs(35))
+        .timeout(Duration::from_secs(timeout_secs)) // Uses GUI setting
         .build().unwrap().get("https://api.telegram.org").send();
 
     let is_working = match result { Ok(resp) => resp.status().is_success(), Err(_) => false };
@@ -520,7 +530,6 @@ fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>) -> bool {
 fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx: Sender<AppEvent>) -> Result<()> {
     let channels = parse_channels(&channels_raw);
 
-    // 🔴 FIXED REGEX: Used the correct raw string syntax (r#"..."#) so quotes don't break the compiler.
     let regex_pattern = r#"(?i)(vless|vmess|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[^\s<>`"'\\]+"#;
     let regex = Regex::new(regex_pattern).unwrap();
     let date_regex = Regex::new(r#"<time datetime="([^"]+)""#).unwrap();
@@ -569,13 +578,16 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
 
                             if is_valid_date {
                                 for m in regex.find_iter(block) {
-                                    // Clean up trailing punctuation that might get attached
                                     let clean_link = m.as_str().trim_end_matches(&['(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'][..]).to_string();
                                     
+                                    // 🔴 NEW: Explicitly ignore Telegram deep links so they aren't parsed as proxies
+                                    if clean_link.starts_with("tg://resolve") || clean_link.starts_with("tg://join") || clean_link.starts_with("tg://set") || clean_link.starts_with("tg://bg") {
+                                        continue;
+                                    }
+
                                     if let Some(proto) = clean_link.split("://").next() {
                                         let proto_lower = proto.to_lowercase();
                                         
-                                        // 🔴 UI FILTER CHECK: If you unchecked it in the UI, we completely ignore it!
                                         let should_keep = config.protocol_rules.get(&proto_lower).map_or(false, |r| r.enabled);
                                         
                                         if should_keep {
@@ -624,13 +636,13 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
             fs::create_dir_all(OUTPUT_TESTED_DIR)?;
             
             for (proto, links) in &new_only {
-                // Now supports both VLESS and TROJAN testing!
                 if proto == "vless" || proto == "trojan" {
                     for link in links {
                         if stop.load(Ordering::SeqCst) { break; }
                         log_worker(&tx, LogLevel::Debug, format!("    🧪 Testing a {} config...", proto.to_uppercase()));
                         
-                        if test_config_safely(link, &tx) {
+                        // Passes user's configurable timeout to the tester
+                        if test_config_safely(link, &tx, config.testing_timeout_seconds) {
                             newly_working_count += 1;
                             log_worker(&tx, LogLevel::Success, "    🟢 SUCCESS! Config loads Telegram.".to_string());
                             
