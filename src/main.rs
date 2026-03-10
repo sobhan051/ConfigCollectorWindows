@@ -1,9 +1,10 @@
+#![windows_subsystem = "windows"]
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use eframe::egui;
 use regex::Regex;
 use reqwest::blocking::ClientBuilder;
-use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -30,11 +31,32 @@ const DEFAULT_PROTOCOLS: [&str; 27] = [
     "nm-dns", "nm-vless", "slipnet-enc", "slipnet", "slipstream", "dnstt",
 ];
 
+// تولید آیکون نرم‌افزار در حافظه برای تسک‌بار ویندوز
+fn generate_icon() -> egui::IconData {
+    let width = 32;
+    let height = 32;
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for _y in 0..height {
+        for _x in 0..width {
+            rgba.push(30);  // R
+            rgba.push(160); // G
+            rgba.push(100); // B
+            rgba.push(255); // A
+        }
+    }
+    egui::IconData {
+        rgba,
+        width,
+        height,
+    }
+}
+
 fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1050.0, 700.0])
-            .with_min_inner_size([850.0, 550.0]),
+            .with_min_inner_size([850.0, 550.0])
+            .with_icon(generate_icon()), // اضافه شدن لوگو
         ..Default::default()
     };
     let _ = eframe::run_native(
@@ -97,7 +119,7 @@ impl Default for AppConfig {
                 p.to_string(),
                 ProtocolRule {
                     enabled: true,
-                    max_count: 5000,
+                    max_count: 500,
                 },
             );
         }
@@ -105,15 +127,15 @@ impl Default for AppConfig {
             interval_minutes: 5,
             max_pages_per_channel: 15,
             lookback_days: 2,
-            engine: ScrapingEngine::RealBrowser, // برگشت به موتور مرورگر (برای عبور از فیلتر و کلادفلر)
+            engine: ScrapingEngine::RealBrowser,
             proxy_type: ProxyType::System,
             proxy_host: "127.0.0.1".to_string(),
             proxy_port: 10808,
-            performance: PerformanceProfile::MediumPC, // پروفایل متعادل برای جلوگیری از هنگ کردن مرورگرها
+            performance: PerformanceProfile::MediumPC,
             ignore_ssl_errors: true,
             remote_dns: true,
             output_new_only_enabled: true,
-            output_append_unique_enabled: true,
+            output_append_unique_enabled: true, // پیش‌فرض برای بکاپ روشن شد
             protocol_rules,
         }
     }
@@ -128,7 +150,7 @@ impl AppConfig {
                         .entry(p.to_string())
                         .or_insert(ProtocolRule {
                             enabled: true,
-                            max_count: 5000,
+                            max_count: 500,
                         });
                 }
                 return cfg;
@@ -236,7 +258,7 @@ impl AppState {
             logs: vec![LogMessage {
                 time: Local::now().format("%H:%M:%S").to_string(),
                 level: LogLevel::Info,
-                text: "🖥️ System Boot: Network Core Reverted to Safe VPN Mode.".to_string(),
+                text: "🖥️ System Boot: Real Browser Engine & Anti-Hang mechanisms loaded.".to_string(),
             }],
             total_configs: 0,
             by_protocol: BTreeMap::new(),
@@ -251,7 +273,7 @@ impl AppState {
     }
 
     fn test_connection(&mut self) {
-        self.proxy_access_status = "Testing connection (Ping)...".to_string();
+        self.proxy_access_status = "Testing connection...".to_string();
         self.proxy_access_ok = None;
         let tx = self.event_tx.clone();
         let config = self.config.clone();
@@ -264,7 +286,7 @@ impl AppState {
                     if html.len() > 100 {
                         let _ = tx.send(AppEvent::PingResult {
                             ok: true,
-                            detail: format!("Online 🟢 ({}ms)", elapsed),
+                            detail: format!("Online ({}ms)", elapsed),
                         });
                         let _ = tx.send(AppEvent::Log(
                             LogLevel::Success,
@@ -273,14 +295,14 @@ impl AppState {
                     } else {
                         let _ = tx.send(AppEvent::PingResult {
                             ok: false,
-                            detail: "Failed (Empty Page) 🔴".to_string(),
+                            detail: "Failed (Empty Page)".to_string(),
                         });
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::PingResult {
                         ok: false,
-                        detail: "Failed 🔴".to_string(),
+                        detail: "Failed".to_string(),
                     });
                     let _ = tx.send(AppEvent::Log(
                         LogLevel::Error,
@@ -448,10 +470,11 @@ impl eframe::App for AppState {
                     .inner_margin(15.0),
             )
             .show(ctx, |ui| {
+                // نام‌گذاری تمیز تب‌ها بدون ایجاد آیکون دوتایی
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.active_tab, 0, "⚙️ Main");
-                    ui.selectable_value(&mut self.active_tab, 1, "📋 Targets");
-                    ui.selectable_value(&mut self.active_tab, 2, "🛡️ Filters");
+                    ui.selectable_value(&mut self.active_tab, 0, "Main");
+                    ui.selectable_value(&mut self.active_tab, 1, "Targets");
+                    ui.selectable_value(&mut self.active_tab, 2, "Filters");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -507,11 +530,6 @@ impl eframe::App for AppState {
                                         "Strong PC (Fast/Heavy)",
                                     );
                                 });
-                            ui.label(
-                                egui::RichText::new("Choose 'Weak PC' if your computer hangs.")
-                                    .small()
-                                    .color(egui::Color32::GRAY),
-                            );
 
                             ui.add_space(15.0);
                             ui.heading(
@@ -566,25 +584,10 @@ impl eframe::App for AppState {
                                 &mut self.config.ignore_ssl_errors,
                                 "Bypass SSL/TLS Filter (For VPNs)",
                             );
-                            if self.config.proxy_type == ProxyType::Socks5 {
-                                ui.checkbox(&mut self.config.remote_dns, "Remote DNS (socks5h)");
-                            }
 
                             ui.add_space(15.0);
                             ui.heading(
-                                egui::RichText::new("📁 Output Settings")
-                                    .color(egui::Color32::LIGHT_BLUE),
-                            );
-                            ui.checkbox(&mut self.config.output_new_only_enabled, "Save 'New Only' Configs");
-                            ui.label(egui::RichText::new("    └ Extracts fresh configs not in history").small().color(egui::Color32::GRAY));
-                            
-                            ui.add_space(5.0);
-                            ui.checkbox(&mut self.config.output_append_unique_enabled, "Save 'Full Backup' (Append)");
-                            ui.label(egui::RichText::new("    └ Adds ALL found configs to old ones").small().color(egui::Color32::GRAY));
-
-                            ui.add_space(15.0);
-                            ui.heading(
-                                egui::RichText::new("⏱️ Scheduler")
+                                egui::RichText::new("⏱️ Scheduler & Dates")
                                     .color(egui::Color32::LIGHT_BLUE),
                             );
                             ui.horizontal(|ui| {
@@ -608,6 +611,20 @@ impl eframe::App for AppState {
                                         .range(1..=30),
                                 );
                             });
+
+                            ui.add_space(15.0);
+                            ui.heading(
+                                egui::RichText::new("💾 Output Settings")
+                                    .color(egui::Color32::LIGHT_BLUE),
+                            );
+                            ui.checkbox(
+                                &mut self.config.output_new_only_enabled,
+                                "Extract New Configs Only (output/new_only)",
+                            );
+                            ui.checkbox(
+                                &mut self.config.output_append_unique_enabled,
+                                "Backup All Unique Configs (output/append_unique)",
+                            );
                         }
                         1 => {
                             ui.heading(
@@ -655,7 +672,7 @@ impl eframe::App for AppState {
                 ui.horizontal(|ui| {
                     ui.group(|ui| {
                         ui.label(
-                            egui::RichText::new("💎 Total In Current Run:").color(egui::Color32::GRAY),
+                            egui::RichText::new("Extracted Total:").color(egui::Color32::GRAY),
                         );
                         ui.label(
                             egui::RichText::new(self.total_configs.to_string())
@@ -671,7 +688,7 @@ impl eframe::App for AppState {
                     };
                     ui.group(|ui| {
                         ui.label(
-                            egui::RichText::new("🌐 Connection:").color(egui::Color32::GRAY),
+                            egui::RichText::new("Connection:").color(egui::Color32::GRAY),
                         );
                         ui.label(
                             egui::RichText::new(&self.proxy_access_status)
@@ -690,16 +707,16 @@ impl eframe::App for AppState {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.heading(
-                                egui::RichText::new("📟 Professional Terminal")
+                                egui::RichText::new("Terminal Log")
                                     .color(egui::Color32::WHITE),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("🗑️ Clear").clicked() {
+                                    if ui.button("Clear").clicked() {
                                         self.logs.clear();
                                     }
-                                    if ui.button("📋 Copy").clicked() {
+                                    if ui.button("Copy").clicked() {
                                         let text = self
                                             .logs
                                             .iter()
@@ -747,18 +764,14 @@ impl eframe::App for AppState {
 }
 
 // =============================================================
-// 🛡️ هسته شبکه ایمن (دقیقاً نسخه اصلی شما که کار می‌کرد)
+// 🛡️ هسته شبکه ایمن و ضد-هنگ (Safe Network Core)
 // =============================================================
 
-fn get_performance_settings(profile: &PerformanceProfile, engine: &ScrapingEngine) -> (Duration, u64, usize) {
-    match (profile, engine) {
-        (PerformanceProfile::WeakPC, ScrapingEngine::RealBrowser) => (Duration::from_secs(4), 18000, 1),
-        (PerformanceProfile::MediumPC, ScrapingEngine::RealBrowser) => (Duration::from_secs(2), 12000, 1),
-        (PerformanceProfile::StrongPC, ScrapingEngine::RealBrowser) => (Duration::from_secs(1), 8000, 2), // برای مرورگر ماکزیمم 2 نخ کافیست تا رم پر نشود
-        
-        (PerformanceProfile::WeakPC, ScrapingEngine::Reqwest) => (Duration::from_millis(1500), 10000, 2),
-        (PerformanceProfile::MediumPC, ScrapingEngine::Reqwest) => (Duration::from_millis(500), 10000, 5),
-        (PerformanceProfile::StrongPC, ScrapingEngine::Reqwest) => (Duration::from_millis(100), 10000, 10),
+fn get_performance_settings(profile: &PerformanceProfile) -> (Duration, u64) {
+    match profile {
+        PerformanceProfile::WeakPC => (Duration::from_secs(4), 18000),
+        PerformanceProfile::MediumPC => (Duration::from_secs(2), 12000),
+        PerformanceProfile::StrongPC => (Duration::from_secs(1), 8000),
     }
 }
 
@@ -770,17 +783,17 @@ fn fetch_html(url: &str, config: &AppConfig) -> Result<String> {
 }
 
 fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
-    let (_, timeout_ms, _) = get_performance_settings(&config.performance, &config.engine);
+    let (_, timeout_ms) = get_performance_settings(&config.performance);
 
     let mut args = vec![
         "--headless=new".to_string(),
         "--dump-dom".to_string(),
         "--disable-gpu".to_string(),
         "--no-sandbox".to_string(),
-        "--disable-dev-shm-usage".to_string(), // بسیار مهم برای جلوگیری از پر شدن حافظه ویندوز
+        "--disable-dev-shm-usage".to_string(),
         "--disable-extensions".to_string(),
         "--mute-audio".to_string(),
-        "--window-size=1920,1080".to_string(), // تلگرام گاهی بدون سایز پنجره محتوا را لود نمی‌کند
+        "--window-size=1920,1080".to_string(),
         format!("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     ];
 
@@ -806,7 +819,7 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
             ));
         }
     }
-    
+
     args.push(url.to_string());
 
     let browsers = [
@@ -817,13 +830,12 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
     ];
 
     for browser in browsers {
-        // استفاده از spawn به جای output برای جلوگیری قطعی از Deadlock (بن بست)
         let mut child_proc = match Command::new(browser)
             .args(&args)
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn() 
+            .spawn()
         {
             Ok(child) => child,
             Err(_) => continue,
@@ -833,20 +845,17 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         let mut stdout_str = String::new();
         let mut is_completed = false;
 
-        // خواندن امن داده‌ها با تایم‌اوت
         if let Some(mut stdout) = child_proc.stdout.take() {
             let mut buffer = [0; 4096];
             loop {
-                // اگر زمان گذشت، خارج شو
                 if start_time.elapsed().as_millis() as u64 > timeout_ms {
                     break;
                 }
 
-                // خواندن غیرمسدودکننده از خروجی مرورگر
                 match stdout.read(&mut buffer) {
                     Ok(0) => {
                         is_completed = true;
-                        break; // پایان اطلاعات
+                        break;
                     }
                     Ok(n) => {
                         let chunk = String::from_utf8_lossy(&buffer[..n]);
@@ -858,19 +867,18 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
             }
         }
 
-        // اگر پروسه گیر کرده بود، آن را با خشونت می‌کشیم تا کامپیوتر هنگ نکند
         if !is_completed {
             let _ = child_proc.kill();
-            return Err(anyhow::anyhow!("Browser timeout exceeded ({}ms). Process safely killed.", timeout_ms));
+            return Err(anyhow::anyhow!("Browser timeout exceeded ({}ms).", timeout_ms));
         }
 
-        let _ = child_proc.wait(); // پاکسازی پروسه از ویندوز
+        let _ = child_proc.wait();
 
         if stdout_str.len() > 50 {
             return Ok(stdout_str);
         }
     }
-    
+
     anyhow::bail!("Failed to execute browser or received empty response.")
 }
 
@@ -912,7 +920,7 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
 }
 
 // =============================================================
-// 🧠 استخراج هوشمند با پشتیبانی از Multi-threading
+// 🧠 استخراج هوشمند با تشخیص تاریخ پست‌های تلگرام
 // =============================================================
 
 fn run_worker(
@@ -922,169 +930,218 @@ fn run_worker(
     tx: Sender<AppEvent>,
 ) -> Result<()> {
     let channels = parse_channels(&channels_raw);
-    let (delay, _, concurrency) = get_performance_settings(&config.performance, &config.engine);
+    let (delay, _) = get_performance_settings(&config.performance);
 
     let regex_pattern = r"(?i)(vmess|vless|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[a-zA-Z0-9\-\._~:/\?#\[\]@!\$&'\(\)\*\+,%;=]+";
-    let regex = Arc::new(Regex::new(regex_pattern).unwrap());
-    let mut history = SentHistory::load();
+    let regex = Regex::new(regex_pattern).unwrap();
+    let date_regex = Regex::new(r#"<time datetime="([^"]+)""#).unwrap();
 
-    log_worker(&tx, LogLevel::Info, format!("🚀 Crawler Started | Engine: {:?} | Threads: {}", config.engine, concurrency));
+    let mut history = SentHistory::load();
+    let threshold_date = Utc::now() - ChronoDuration::days(config.lookback_days.max(1));
+
+    log_worker(
+        &tx,
+        LogLevel::Info,
+        format!(
+            "🚀 Crawler Started | Engine: {:?} | Profile: {:?}",
+            config.engine, config.performance
+        ),
+    );
 
     loop {
-        if stop.load(Ordering::SeqCst) { break; }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         history.prune(config.lookback_days);
-        
-        let mut global_gathered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut gathered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut total_run_configs = 0;
 
-        for chunk in channels.chunks(concurrency) {
-            if stop.load(Ordering::SeqCst) { break; }
+        for channel in &channels {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            log_worker(
+                &tx,
+                LogLevel::Info,
+                format!("📡 Scanning channel: @{}", channel),
+            );
 
-            thread::scope(|s| {
-                let mut handles = vec![];
+            let mut before: Option<String> = None;
+            let mut channel_configs = 0;
 
-                for channel in chunk {
-                    let tx_clone = tx.clone();
-                    let config_clone = config.clone();
-                    let stop_clone = stop.clone();
-                    let regex_clone = regex.clone();
-                    let chan = channel.clone();
-
-                    let h = s.spawn(move || {
-                        let mut local_gathered = BTreeMap::new();
-                        let mut channel_configs = 0;
-                        let mut before: Option<String> = None;
-
-                        log_worker(&tx_clone, LogLevel::Info, format!("📡 Scanning channel: @{}", chan));
-
-                        for page in 1..=config_clone.max_pages_per_channel {
-                            if stop_clone.load(Ordering::SeqCst) { break; }
-                            let mut url = format!("https://t.me/s/{}", chan);
-                            if let Some(ref id) = before { url.push_str(&format!("?before={}", id)); }
-
-                            match fetch_html(&url, &config_clone) {
-                                Ok(raw_html) => {
-                                    let mut found_in_page = 0;
-                                    let mut next_before = None;
-
-                                    let decoded_html = raw_html
-                                        .replace("&amp;", "&")
-                                        .replace("&lt;", "<")
-                                        .replace("&gt;", ">")
-                                        .replace("&quot;", "\"")
-                                        .replace("&#39;", "'");
-
-                                    let date_regex = Regex::new(r#"<time datetime="([^"]+)""#).unwrap();
-                                    let mut latest_time_in_page: Option<DateTime<Utc>> = None;
-                                    
-                                    for cap in date_regex.captures_iter(&decoded_html) {
-                                        if let Ok(parsed_time) = DateTime::parse_from_rfc3339(&cap[1]) {
-                                            let utc_time = parsed_time.with_timezone(&Utc);
-                                            if latest_time_in_page.is_none() || utc_time > latest_time_in_page.unwrap() {
-                                                latest_time_in_page = Some(utc_time);
-                                            }
-                                        }
-                                    }
-
-                                    let mut reached_old_posts = false;
-                                    if let Some(latest) = latest_time_in_page {
-                                        let threshold = Utc::now() - ChronoDuration::days(config_clone.lookback_days.max(1));
-                                        if latest < threshold { reached_old_posts = true; }
-                                    }
-
-                                    let next_regex = Regex::new(r#"data-post="[^/]+/(\d+)""#).unwrap();
-                                    for cap in next_regex.captures_iter(&decoded_html) {
-                                        next_before = Some(cap[1].to_string());
-                                    }
-
-                                    for m in regex_clone.find_iter(&decoded_html) {
-                                        let full_match = m.as_str();
-                                        let clean_link = full_match
-                                            .trim_end_matches(&['(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'][..])
-                                            .to_string();
-
-                                        if let Some(proto_raw) = clean_link.split("://").next() {
-                                            let mut proto = proto_raw.to_lowercase();
-                                            if proto == "hy2" { proto = "hysteria2".to_string(); }
-                                            
-                                            found_in_page += 1;
-                                            local_gathered.entry(proto).or_insert_with(BTreeSet::new).insert(clean_link);
-                                        }
-                                    }
-
-                                    if found_in_page > 0 {
-                                        log_worker(&tx_clone, LogLevel::Success, format!("    ✔️ @{} | Page {}: {} configs.", chan, page, found_in_page));
-                                    }
-
-                                    channel_configs += found_in_page;
-                                    before = next_before;
-
-                                    if reached_old_posts {
-                                        log_worker(&tx_clone, LogLevel::Warning, format!("    ⏳ @{} reached posts older than {} days. Stopping pagination.", chan, config_clone.lookback_days));
-                                        break;
-                                    }
-
-                                    if before.is_none() { break; }
-                                }
-                                Err(e) => { log_worker(&tx_clone, LogLevel::Error, format!("    ❌ @{} | Page {} failed: {}", chan, page, extract_error_msg(&e))); }
-                            }
-                            thread::sleep(delay);
-                        }
-                        
-                        log_worker(&tx_clone, LogLevel::Info, format!("🏁 Finished @{}: Total {} configs.", chan, channel_configs));
-                        (chan, channel_configs, local_gathered)
-                    });
-                    handles.push(h);
+            for page in 1..=config.max_pages_per_channel {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut url = format!("https://t.me/s/{}", channel);
+                if let Some(ref id) = before {
+                    url.push_str(&format!("?before={}", id));
                 }
 
-                for h in handles {
-                    if let Ok((_chan, count, local_gathered)) = h.join() {
-                        total_run_configs += count;
-                        for (proto, links) in local_gathered {
-                            global_gathered.entry(proto).or_default().extend(links);
+                log_worker(
+                    &tx,
+                    LogLevel::Debug,
+                    format!("  ➜ Fetching page {} [{}]", page, url),
+                );
+
+                match fetch_html(&url, &config) {
+                    Ok(raw_html) => {
+                        let mut found_in_page = 0;
+                        let mut next_before = None;
+
+                        let decoded_html = raw_html
+                            .replace("&amp;", "&")
+                            .replace("&lt;", "<")
+                            .replace("&gt;", ">")
+                            .replace("&quot;", "\"");
+
+                        // دکمه صفحه قبل
+                        let next_regex = Regex::new(r#"data-post="[^/]+/(\d+)""#).unwrap();
+                        for cap in next_regex.captures_iter(&decoded_html) {
+                            next_before = Some(cap[1].to_string());
                         }
+
+                        // شکستن صفحه به پیام‌های مجزا برای چک کردن تاریخ هر پست
+                        let blocks: Vec<&str> = decoded_html.split("tgme_widget_message ").collect();
+                        
+                        for block in blocks {
+                            let mut is_valid_date = true;
+                            
+                            // استخراج تاریخ از بلوک پیام
+                            if let Some(caps) = date_regex.captures(block) {
+                                if let Ok(parsed_date) = DateTime::parse_from_rfc3339(&caps[1]) {
+                                    if parsed_date.with_timezone(&Utc) < threshold_date {
+                                        is_valid_date = false; // پیام قدیمی است
+                                    }
+                                }
+                            }
+
+                            if is_valid_date {
+                                for m in regex.find_iter(block) {
+                                    let full_match = m.as_str();
+                                    let clean_link = full_match
+                                        .trim_end_matches(&[
+                                            '(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'
+                                        ][..])
+                                        .to_string();
+
+                                    if let Some(proto) = clean_link.split("://").next() {
+                                        found_in_page += 1;
+                                        gathered
+                                            .entry(proto.to_lowercase())
+                                            .or_default()
+                                            .insert(clean_link);
+                                    }
+                                }
+                            }
+                        }
+
+                        if found_in_page > 0 {
+                            log_worker(
+                                &tx,
+                                LogLevel::Success,
+                                format!("    ✔️ Page {}: {} configs extracted.", page, found_in_page),
+                            );
+                        } else {
+                            log_worker(
+                                &tx,
+                                LogLevel::Warning,
+                                format!("    ⚠️ Page {}: No valid configs (or posts are too old).", page),
+                            );
+                            if next_before.is_none() {
+                                break;
+                            }
+                        }
+
+                        channel_configs += found_in_page;
+                        before = next_before;
+                    }
+                    Err(e) => {
+                        log_worker(
+                            &tx,
+                            LogLevel::Error,
+                            format!("    ❌ Page {} failed: {}", page, extract_error_msg(&e)),
+                        );
                     }
                 }
-            });
-            thread::sleep(Duration::from_secs(2));
+                thread::sleep(delay);
+            }
+
+            total_run_configs += channel_configs;
+            log_worker(
+                &tx,
+                LogLevel::Info,
+                format!("🏁 Finished @{}: Total {} configs.", channel, channel_configs),
+            );
+            thread::sleep(Duration::from_secs(3));
         }
 
+        // --- پردازش و خروجی فایل‌ها ---
+        apply_protocol_limits(&mut gathered, &config.protocol_rules);
+
         let mut new_only: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (proto, links) in &global_gathered {
+        let mut total_new = 0;
+
+        for (proto, links) in &gathered {
             for link in links {
                 if !history.sent_at.contains_key(link) {
                     history.sent_at.insert(link.clone(), Utc::now());
                     new_only.entry(proto.clone()).or_default().insert(link.clone());
+                    total_new += 1;
                 }
             }
         }
 
-        apply_protocol_limits(&mut new_only, &config.protocol_rules);
-        apply_protocol_limits(&mut global_gathered, &config.protocol_rules);
-
         let mut by_protocol = BTreeMap::new();
-        let mut total_new = 0;
         for (k, v) in &new_only {
             by_protocol.insert(k.clone(), v.len());
-            total_new += v.len();
         }
 
+        // بررسی اینکه اگر تیک‌ها فعال هستند و دیتایی وجود دارد، بنویس
         if config.output_new_only_enabled {
-            let _ = write_configs_safe(OUTPUT_NEW_DIR, &new_only, &config, false);
+            if !new_only.is_empty() {
+                if let Err(e) = write_outputs_replace(OUTPUT_NEW_DIR, &new_only) {
+                    log_worker(&tx, LogLevel::Error, format!("IO Error (New Only): {}", e));
+                }
+            } else {
+                log_worker(&tx, LogLevel::Warning, "No new configs found to write in 'new_only' folder.".to_string());
+            }
         }
         
         if config.output_append_unique_enabled {
-            let _ = write_configs_safe(OUTPUT_APPEND_DIR, &global_gathered, &config, true);
+            if !gathered.is_empty() {
+                // برای بکاپ، ما کل gathered (تعداد پیدا شده در این دور) را می‌دهیم 
+                // تا به فایل قبلی افزوده شوند. تابع ضداضافه‌کردن تکراری در خود append_unique وجود دارد.
+                if let Err(e) = write_outputs_append_unique(OUTPUT_APPEND_DIR, &gathered) {
+                    log_worker(&tx, LogLevel::Error, format!("IO Error (Append Unique): {}", e));
+                }
+            }
         }
 
         let _ = history.save();
-        let _ = tx.send(AppEvent::Stats { total: total_new, by_protocol });
+        let _ = tx.send(AppEvent::Stats {
+            total: total_new,
+            by_protocol,
+        });
 
-        log_worker(&tx, LogLevel::Success, format!("🎉 Cycle Complete! Parsed {} total, {} were NEW.", total_run_configs, total_new));
-        log_worker(&tx, LogLevel::Info, format!("💤 Sleeping for {} minutes...", config.interval_minutes));
+        log_worker(
+            &tx,
+            LogLevel::Success,
+            format!(
+                "🎉 Global Cycle Complete! Parsed {} total, {} were NEW.",
+                total_run_configs, total_new
+            ),
+        );
+        log_worker(
+            &tx,
+            LogLevel::Info,
+            format!("💤 Sleeping for {} minutes...", config.interval_minutes),
+        );
 
         for _ in 0..(config.interval_minutes * 60) {
-            if stop.load(Ordering::SeqCst) { break; }
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
             thread::sleep(Duration::from_secs(1));
         }
     }
@@ -1092,19 +1149,27 @@ fn run_worker(
 }
 
 // =============================================================
-// توابع ذخیره سازی فایل و Base64 کاملا امن
+// توابع کمکی فایل‌ها و پردازش
 // =============================================================
 
 fn extract_error_msg(err: &anyhow::Error) -> String {
     let mut chain = Vec::new();
     let mut current = Some(err.as_ref() as &dyn std::error::Error);
-    while let Some(e) = current { chain.push(e.to_string()); current = e.source(); }
+    while let Some(e) = current {
+        chain.push(e.to_string());
+        current = e.source();
+    }
     chain.join(" -> ")
 }
 
-fn log_worker(tx: &Sender<AppEvent>, level: LogLevel, text: String) { let _ = tx.send(AppEvent::Log(level, text)); }
+fn log_worker(tx: &Sender<AppEvent>, level: LogLevel, text: String) {
+    let _ = tx.send(AppEvent::Log(level, text));
+}
 
-fn apply_protocol_limits(store: &mut BTreeMap<String, BTreeSet<String>>, rules: &BTreeMap<String, ProtocolRule>) {
+fn apply_protocol_limits(
+    store: &mut BTreeMap<String, BTreeSet<String>>,
+    rules: &BTreeMap<String, ProtocolRule>,
+) {
     for (proto, links) in store.iter_mut() {
         if let Some(rule) = rules.get(proto) {
             if links.len() > rule.max_count {
@@ -1114,69 +1179,68 @@ fn apply_protocol_limits(store: &mut BTreeMap<String, BTreeSet<String>>, rules: 
     }
 }
 
-fn write_configs_safe(
-    base_dir: &str, 
-    store: &BTreeMap<String, BTreeSet<String>>, 
-    config: &AppConfig, 
-    append_mode: bool
-) -> Result<()> {
+fn write_outputs_replace(base_dir: &str, store: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
+    if store.is_empty() {
+        return Ok(());
+    }
     fs::create_dir_all(base_dir)?;
-    let mut mixed = BTreeSet::new();
-
-    for (proto, rule) in &config.protocol_rules {
-        if !rule.enabled { continue; }
-
-        let mut current_set = BTreeSet::new();
-        let path_txt = Path::new(base_dir).join(format!("{}.txt", proto));
-        let path_b64 = Path::new(base_dir).join(format!("{}_base64.txt", proto));
-
-        if append_mode {
-            if let Ok(existing) = read_existing_set(&path_txt) {
-                current_set.extend(existing);
-            }
-        }
-
-        if let Some(links) = store.get(proto) {
-            current_set.extend(links.iter().cloned());
-        }
-
-        if !current_set.is_empty() {
-            let text_content = current_set.iter().cloned().collect::<Vec<_>>().join("\n");
-            fs::write(&path_txt, &text_content)?;
-            
-            use base64::{Engine as _, engine::general_purpose::STANDARD};
-            fs::write(&path_b64, STANDARD.encode(&text_content))?;
-            
-            mixed.extend(current_set);
-        }
+    let mut mixed = Vec::new();
+    for (p, links) in store {
+        if links.is_empty() { continue; }
+        let lines: Vec<String> = links.iter().cloned().collect();
+        fs::write(
+            Path::new(base_dir).join(format!("{p}.txt")),
+            lines.join("\n"),
+        )?;
+        mixed.extend(lines);
     }
-
     if !mixed.is_empty() {
-        let path_mixed = Path::new(base_dir).join("mixed.txt");
-        let path_mixed_b64 = Path::new(base_dir).join("mixed_base64.txt");
-        
-        let mut final_mixed = if append_mode {
-            read_existing_set(&path_mixed).unwrap_or_default()
-        } else {
-            BTreeSet::new()
-        };
-        
-        final_mixed.extend(mixed);
-        
-        let mixed_text = final_mixed.into_iter().collect::<Vec<_>>().join("\n");
-        fs::write(&path_mixed, &mixed_text)?;
-        
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        fs::write(&path_mixed_b64, STANDARD.encode(&mixed_text))?;
+        fs::write(Path::new(base_dir).join("mixed.txt"), mixed.join("\n"))?;
     }
+    Ok(())
+}
 
+fn write_outputs_append_unique(
+    base_dir: &str,
+    store: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<()> {
+    if store.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(base_dir)?;
+    for (p, links) in store {
+        if links.is_empty() { continue; }
+        let path = Path::new(base_dir).join(format!("{p}.txt"));
+        let mut combined = read_existing_set(&path)?;
+        combined.extend(links.iter().cloned());
+        let lines: Vec<String> = combined.into_iter().collect();
+        fs::write(&path, lines.join("\n"))?;
+    }
+    
+    // آپدیت فایل mixed بکاپ
+    let path_mixed = Path::new(base_dir).join("mixed.txt");
+    let mut mixed = read_existing_set(&path_mixed)?;
+    for links in store.values() {
+        mixed.extend(links.iter().cloned());
+    }
+    if !mixed.is_empty() {
+        let mixed_lines: Vec<String> = mixed.into_iter().collect();
+        fs::write(path_mixed, mixed_lines.join("\n"))?;
+    }
     Ok(())
 }
 
 fn read_existing_set(path: &Path) -> Result<BTreeSet<String>> {
-    if !path.exists() { return Ok(BTreeSet::new()); }
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
     let raw = fs::read_to_string(path)?;
-    let lines = raw.lines().map(str::trim).filter(|l| !l.is_empty()).map(ToOwned::to_owned).collect();
+    let lines = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
     Ok(lines)
 }
 
@@ -1185,9 +1249,17 @@ fn parse_channels(raw: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|line| {
-            if let Some(rest) = line.strip_prefix('@') { return Some(rest.to_string()); }
+            if let Some(rest) = line.strip_prefix('@') {
+                return Some(rest.to_string());
+            }
             if line.contains("t.me/") {
-                return line.split("t.me/").nth(1).map(|x| x.split('?').next().unwrap_or_default().trim_matches('/').to_string());
+                return line.split("t.me/").nth(1).map(|x| {
+                    x.split('?')
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches('/')
+                        .to_string()
+                });
             }
             Some(line.to_string())
         })
