@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use eframe::egui;
 use regex::Regex;
@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -57,7 +57,7 @@ fn main() {
     let _ = eframe::run_native(
         "⚡ Config Collector Pro (Windows Edition)",
         options,
-        Box::new(|_| Ok(Box::new(AppState::bootstrap()))),
+        Box::new(|_| Box::new(AppState::bootstrap())),
     );
 }
 
@@ -120,10 +120,10 @@ impl Default for AppConfig {
             interval_minutes: 15,
             max_pages_per_channel: 5,
             lookback_days: 2,
-            engine: ScrapingEngine::Reqwest, // Using Reqwest by default as it worked for you
+            engine: ScrapingEngine::Reqwest,
             proxy_type: ProxyType::Http,
             proxy_host: "127.0.0.1".to_string(),
-            proxy_port: 10880, // Pointing to Psiphon by default
+            proxy_port: 10880,
             performance: PerformanceProfile::MediumPC,
             ignore_ssl_errors: true,
             remote_dns: true,
@@ -388,15 +388,15 @@ impl eframe::App for AppState {
 
                         if matches!(self.config.proxy_type, ProxyType::Http | ProxyType::Socks5) {
                             ui.horizontal(|ui| { ui.label("IP:"); ui.text_edit_singleline(&mut self.config.proxy_host); });
-                            ui.horizontal(|ui| { ui.label("Port:"); ui.add(egui::DragValue::new(&mut self.config.proxy_port).range(1..=65535)); });
+                            ui.horizontal(|ui| { ui.label("Port:"); ui.add(egui::DragValue::new(&mut self.config.proxy_port).clamp_range(1..=65535)); });
                         }
                         ui.checkbox(&mut self.config.ignore_ssl_errors, "Bypass SSL/TLS Filter (For VPNs)");
 
                         ui.add_space(15.0);
                         ui.heading(egui::RichText::new("⏱️ Scheduler & Dates").color(egui::Color32::LIGHT_BLUE));
-                        ui.horizontal(|ui| { ui.label("Interval (Min):"); ui.add(egui::DragValue::new(&mut self.config.interval_minutes).range(1..=240)); });
-                        ui.horizontal(|ui| { ui.label("Max Pages:"); ui.add(egui::DragValue::new(&mut self.config.max_pages_per_channel).range(1..=100)); });
-                        ui.horizontal(|ui| { ui.label("Lookback Days:"); ui.add(egui::DragValue::new(&mut self.config.lookback_days).range(1..=30)); });
+                        ui.horizontal(|ui| { ui.label("Interval (Min):"); ui.add(egui::DragValue::new(&mut self.config.interval_minutes).clamp_range(1..=240)); });
+                        ui.horizontal(|ui| { ui.label("Max Pages:"); ui.add(egui::DragValue::new(&mut self.config.max_pages_per_channel).clamp_range(1..=100)); });
+                        ui.horizontal(|ui| { ui.label("Lookback Days:"); ui.add(egui::DragValue::new(&mut self.config.lookback_days).clamp_range(1..=30)); });
 
                         ui.add_space(15.0);
                         ui.heading(egui::RichText::new("💾 Output & Testing Settings").color(egui::Color32::LIGHT_BLUE));
@@ -413,7 +413,7 @@ impl eframe::App for AppState {
                         for (name, rule) in &mut self.config.protocol_rules {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut rule.enabled, name);
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.add(egui::DragValue::new(&mut rule.max_count).range(1..=50000)); });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.add(egui::DragValue::new(&mut rule.max_count).clamp_range(1..=50000)); });
                             });
                         }
                     }
@@ -476,7 +476,6 @@ impl eframe::App for AppState {
 
 fn get_performance_settings(profile: &PerformanceProfile) -> (Duration, u64) {
     match profile {
-        // Significantly increased timeouts for DPI / Psiphon environments
         PerformanceProfile::WeakPC => (Duration::from_secs(5), 60000),
         PerformanceProfile::MediumPC => (Duration::from_secs(3), 45000),
         PerformanceProfile::StrongPC => (Duration::from_secs(2), 30000),
@@ -503,7 +502,7 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         "--mute-audio".to_string(),
         "--ignore-certificate-errors".to_string(),
         "--ignore-ssl-errors".to_string(),
-        "--blink-settings=imagesEnabled=false".to_string(), // Crucial for bandwidth!
+        "--blink-settings=imagesEnabled=false".to_string(),
         "--window-size=1920,1080".to_string(),
         format!("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     ];
@@ -555,8 +554,7 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
     let mut b = ClientBuilder::new()
         .timeout(Duration::from_secs(20))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
-        .danger_accept_invalid_certs(config.ignore_ssl_errors)
-        .trust_dns(true); // Prevents local DNS leaks!
+        .danger_accept_invalid_certs(config.ignore_ssl_errors);
 
     match config.proxy_type {
         ProxyType::None => { b = b.no_proxy(); }
@@ -605,7 +603,7 @@ fn generate_vless_json(link: &str, test_port: u16) -> Option<String> {
                 "vnext":[{
                     "address": host,
                     "port": port,
-                    "users": [{ "id": uuid, "encryption": "none", "flow": flow }]
+                    "users":[{ "id": uuid, "encryption": "none", "flow": flow }]
                 }]
             },
             "streamSettings": {
@@ -623,7 +621,7 @@ fn generate_vless_json(link: &str, test_port: u16) -> Option<String> {
 }
 
 fn test_config_safely(vless_link: &str, tx: &Sender<AppEvent>) -> bool {
-    let test_port = 10090; // Isolated port, completely separate from Psiphon
+    let test_port = 10090;
     
     let json_config = match generate_vless_json(vless_link, test_port) {
         Some(c) => c,
@@ -647,13 +645,12 @@ fn test_config_safely(vless_link: &str, tx: &Sender<AppEvent>) -> bool {
             }
         };
 
-    // Give the core 5 seconds to establish TLS/Reality handshakes
     thread::sleep(Duration::from_secs(5));
 
     let proxy_url = format!("socks5h://127.0.0.1:{}", test_port);
     let result = reqwest::blocking::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
-        .timeout(Duration::from_secs(35)) // Wait up to 35 seconds to load Telegram via this config
+        .timeout(Duration::from_secs(35))
         .build()
         .unwrap()
         .get("https://api.telegram.org")
@@ -664,7 +661,6 @@ fn test_config_safely(vless_link: &str, tx: &Sender<AppEvent>) -> bool {
         Err(_) => false,
     };
 
-    // Kill core and clean up
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(&temp_file);
@@ -746,7 +742,7 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
                         before = next_before;
                     }
                     Err(e) => {
-                        log_worker(&tx, LogLevel::Warning, format!("    ⚠️ Page {} failed to load over Psiphon. Retrying later.", page));
+                        log_worker(&tx, LogLevel::Warning, format!("    ⚠️ Page {} failed to load over Psiphon. Error: {}", page, e));
                     }
                 }
                 thread::sleep(delay);
@@ -778,9 +774,6 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
             let _ = write_outputs_append_unique(OUTPUT_APPEND_DIR, &gathered);
         }
 
-        // ==========================================
-        // SILENT TESTING PHASE (Tests ONLY New configs)
-        // ==========================================
         let mut newly_working_count = 0;
         
         if config.test_configs_enabled && !new_only.is_empty() {
@@ -788,7 +781,6 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
             fs::create_dir_all(OUTPUT_TESTED_DIR)?;
             
             for (proto, links) in &new_only {
-                // Currently only tests VLESS. You can expand `generate_vless_json` to support others later.
                 if proto == "vless" {
                     for link in links {
                         if stop.load(Ordering::SeqCst) { break; }
@@ -798,7 +790,6 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
                             newly_working_count += 1;
                             log_worker(&tx, LogLevel::Success, "    🟢 SUCCESS! Config loads Telegram.".to_string());
                             
-                            // Save working config immediately
                             let path = Path::new(OUTPUT_TESTED_DIR).join("working_vless.txt");
                             let mut combined = read_existing_set(&path).unwrap_or_default();
                             combined.insert(link.clone());
