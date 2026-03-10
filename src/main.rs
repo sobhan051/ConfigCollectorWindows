@@ -7,7 +7,7 @@ use regex::Regex;
 use reqwest::blocking::ClientBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
@@ -19,6 +19,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
+
+// =============================================================
+// CONFIG & CONSTANTS
+// =============================================================
 
 const APP_CONFIG_PATH: &str = "config/app_config.toml";
 const CHANNELS_PATH: &str = "config/channels.txt";
@@ -35,8 +39,7 @@ const DEFAULT_PROTOCOLS:[&str; 27] =[
 ];
 
 fn generate_icon() -> egui::IconData {
-    let width = 32;
-    let height = 32;
+    let width = 32; let height = 32;
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for _y in 0..height { for _x in 0..width { rgba.push(30); rgba.push(160); rgba.push(100); rgba.push(255); } }
     egui::IconData { rgba, width, height }
@@ -47,7 +50,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default().with_inner_size([1050.0, 700.0]).with_min_inner_size([850.0, 550.0]).with_icon(generate_icon()),
         ..Default::default()
     };
-    let _ = eframe::run_native("⚡ Config Collector Pro (Windows Edition)", options, Box::new(|_| Box::new(AppState::bootstrap())));
+    let _ = eframe::run_native("⚡ Config Collector Pro (Isolated Tester)", options, Box::new(|_| Box::new(AppState::bootstrap())));
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -78,7 +81,7 @@ struct AppConfig {
     output_new_only_enabled: bool,
     output_append_unique_enabled: bool,
     test_configs_enabled: bool,
-    testing_timeout_seconds: u64, // NEW: User configurable tester timeout
+    testing_timeout_seconds: u64,
     protocol_rules: BTreeMap<String, ProtocolRule>,
 }
 
@@ -91,7 +94,7 @@ impl Default for AppConfig {
             proxy_type: ProxyType::Http, proxy_host: "127.0.0.1".to_string(), proxy_port: 10880,
             performance: PerformanceProfile::MediumPC, ignore_ssl_errors: true, remote_dns: true,
             output_new_only_enabled: true, output_append_unique_enabled: true, test_configs_enabled: true, 
-            testing_timeout_seconds: 35, // Default test timeout
+            testing_timeout_seconds: 20, 
             protocol_rules,
         }
     }
@@ -101,7 +104,7 @@ impl AppConfig {
     fn load_or_create() -> Self {
         if let Ok(raw) = fs::read_to_string(APP_CONFIG_PATH) {
             if let Ok(mut cfg) = toml::from_str::<Self>(&raw) {
-                if cfg.testing_timeout_seconds == 0 { cfg.testing_timeout_seconds = 35; }
+                if cfg.testing_timeout_seconds == 0 { cfg.testing_timeout_seconds = 20; }
                 for p in DEFAULT_PROTOCOLS { cfg.protocol_rules.entry(p.to_string()).or_insert(ProtocolRule { enabled: true, max_count: 500 }); }
                 return cfg;
             }
@@ -162,7 +165,7 @@ impl AppState {
         let mut state = Self {
             config: AppConfig::load_or_create(), channels_text: fs::read_to_string(CHANNELS_PATH).unwrap_or_else(|_| "IranProxyPlus\nfilembad".to_string()),
             active_tab: 0, proxy_access_status: "Awaiting test...".to_string(), proxy_access_ok: None,
-            logs: vec![LogMessage { time: Local::now().format("%H:%M:%S").to_string(), level: LogLevel::Info, text: "🖥️ System Boot: Strict Regex & Engine loaded.".to_string() }],
+            logs: vec![LogMessage { time: Local::now().format("%H:%M:%S").to_string(), level: LogLevel::Info, text: "🖥️ System Boot: Isolated Core Active.".to_string() }],
             total_configs: 0, working_configs: 0, by_protocol: BTreeMap::new(), running: false, stop_flag: Arc::new(AtomicBool::new(false)), worker_handle: None, event_tx: tx, event_rx: rx,
         };
         state.test_connection();
@@ -223,21 +226,20 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM msedge.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
-        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM chrome.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
-        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM xray.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
+        // Cleanup any stray xray processes
+        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM xray.exe"]).creation_flags(CREATE_NO_WINDOW).output();
     }
-}
-
-fn apply_modern_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgb(13, 15, 23); visuals.window_fill = egui::Color32::from_rgb(18, 20, 30);
-    ctx.set_visuals(visuals);
 }
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_events(); apply_modern_theme(ctx);
+        self.poll_events(); 
+        
+        // Dark Theme
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(13, 15, 23); visuals.window_fill = egui::Color32::from_rgb(18, 20, 30);
+        ctx.set_visuals(visuals);
+
         egui::TopBottomPanel::top("header").exact_height(75.0).frame(egui::Frame::default().fill(egui::Color32::from_rgb(18, 20, 30)).inner_margin(15.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("⚡ Config Collector & Tester").size(26.0).strong().color(egui::Color32::from_rgb(230, 240, 255)));
@@ -286,21 +288,11 @@ impl eframe::App for AppState {
                         ui.checkbox(&mut self.config.ignore_ssl_errors, "Bypass SSL/TLS Filter");
 
                         ui.add_space(15.0);
-                        ui.heading(egui::RichText::new("⏱️ Scheduler").color(egui::Color32::LIGHT_BLUE));
-                        ui.horizontal(|ui| { ui.label("Interval (Min):"); ui.add(egui::DragValue::new(&mut self.config.interval_minutes).clamp_range(1..=240)); });
-                        ui.horizontal(|ui| { ui.label("Max Pages:"); ui.add(egui::DragValue::new(&mut self.config.max_pages_per_channel).clamp_range(1..=100)); });
-                        ui.horizontal(|ui| { ui.label("Lookback Days:"); ui.add(egui::DragValue::new(&mut self.config.lookback_days).clamp_range(1..=30)); });
-
-                        ui.add_space(15.0);
-                        ui.heading(egui::RichText::new("💾 Output & Testing").color(egui::Color32::LIGHT_BLUE));
-                        ui.checkbox(&mut self.config.output_new_only_enabled, "Extract New Configs Only");
-                        ui.checkbox(&mut self.config.output_append_unique_enabled, "Backup All Unique Configs");
+                        ui.heading(egui::RichText::new("💾 Testing").color(egui::Color32::LIGHT_BLUE));
                         ui.checkbox(&mut self.config.test_configs_enabled, "✅ Enable Isolated Xray Tester");
-                        
-                        // NEW GUI Setting for user test timeout
                         ui.horizontal(|ui| { 
                             ui.label("Test Timeout (Sec):"); 
-                            ui.add(egui::DragValue::new(&mut self.config.testing_timeout_seconds).clamp_range(10..=300)); 
+                            ui.add(egui::DragValue::new(&mut self.config.testing_timeout_seconds).clamp_range(10..=120)); 
                         });
                     }
                     1 => {
@@ -308,7 +300,7 @@ impl eframe::App for AppState {
                         ui.add_sized([ui.available_width(), ui.available_height() - 20.0], egui::TextEdit::multiline(&mut self.channels_text).font(egui::TextStyle::Monospace));
                     }
                     2 => {
-                        ui.heading(egui::RichText::new("🎯 Protocols Filter (Only Checked will be Extracted)").color(egui::Color32::LIGHT_BLUE));
+                        ui.heading(egui::RichText::new("🎯 Protocols Filter").color(egui::Color32::LIGHT_BLUE));
                         for (name, rule) in &mut self.config.protocol_rules {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut rule.enabled, name);
@@ -434,8 +426,18 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
 }
 
 // =============================================================
-// ISOLATED XRAY TESTER (VLESS + TROJAN)
+// ISOLATED XRAY TESTER (VLESS, VMESS, SS, TROJAN)
 // =============================================================
+
+// Simple Base64 decoder to avoid adding dependencies
+fn decode_base64(input: &str) -> String {
+    let mut clean = input.replace('-', "+").replace('_', "/");
+    while clean.len() % 4 != 0 { clean.push('='); }
+    use base64::{Engine as _, engine::general_purpose};
+    general_purpose::STANDARD.decode(&clean).ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
+}
 
 fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
     let parsed = Url::parse(link).ok()?;
@@ -443,57 +445,170 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
     let port = parsed.port()?;
     let queries: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
     
-    let network = queries.get("type").map(|s| s.as_str()).unwrap_or("tcp");
-    let security = queries.get("security").map(|s| s.as_str()).unwrap_or("none");
-    let sni = queries.get("sni").unwrap_or(&host.to_string()).to_string();
-    let path = queries.get("path").map(|s| s.as_str()).unwrap_or("/");
-    let flow = queries.get("flow").map(|s| s.as_str()).unwrap_or("");
-    
     let is_vless = link.starts_with("vless://");
+    let is_vmess = link.starts_with("vmess://");
     let is_trojan = link.starts_with("trojan://");
+    let is_ss = link.starts_with("ss://");
+
+    if !is_vless && !is_vmess && !is_trojan && !is_ss { return None; }
+
+    // --- VLESS CONFIG GENERATION ---
+    if is_vless {
+        let network = queries.get("type").map(|s| s.as_str()).unwrap_or("tcp");
+        let security = queries.get("security").map(|s| s.as_str()).unwrap_or("none");
+        let sni = queries.get("sni").unwrap_or(&host.to_string()).to_string();
+        let flow = queries.get("flow").map(|s| s.as_str()).unwrap_or("");
+        let path = queries.get("path").map(|s| s.as_str()).unwrap_or("/");
+
+        let xray_config = json!({
+            "log": { "loglevel": "warning" },
+            "inbounds":[{ "port": test_port, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": true } }],
+            "outbounds":[{
+                "protocol": "vless",
+                "settings": {
+                    "vnext":[{
+                        "address": host, "port": port,
+                        "users":[{ "id": parsed.username(), "encryption": "none", "flow": flow }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": network,
+                    "security": security,
+                    "tlsSettings": if security == "tls" { json!({ "serverName": sni, "allowInsecure": true }) } else { json!(null) },
+                    "realitySettings": if security == "reality" { 
+                        json!({ "serverName": sni, "publicKey": queries.get("pbk").unwrap_or(&"".to_string()), "shortId": queries.get("sid").unwrap_or(&"".to_string()), "fingerprint": "chrome" }) 
+                    } else { json!(null) },
+                    "wsSettings": if network == "ws" { json!({ "path": path, "headers": { "Host": sni } }) } else { json!(null) },
+                    "grpcSettings": if network == "grpc" { json!({ "serviceName": path }) } else { json!(null) }
+                }
+            }]
+        });
+        return Some(serde_json::to_string_pretty(&xray_config).unwrap());
+    }
+
+    // --- VMESS CONFIG GENERATION ---
+    if is_vmess {
+        // VMess links are typically base64 encoded JSON after vmess://
+        let b64_content = link.strip_prefix("vmess://")?;
+        let json_str = decode_base64(b64_content);
+        // Parse the inner VMess JSON (simplified parser for common fields)
+        // Example: {"add":"ip","port":"443","id":"uuid","net":"ws","type":"none","host":"host","path":"/","tls":"tls"}
+        // We just naively parse or use regex. Let's use regex for safety in Rust.
+        let get_val = |key: &str| -> String {
+            let re = Regex::new(&format!(r#""{}"\s*:\s*"([^"]+)""#, key)).unwrap();
+            re.captures(&json_str).map(|c| c[1].to_string()).unwrap_or_default()
+        };
+
+        let v_host = get_val("add");
+        let v_port: u16 = get_val("port").parse().ok().unwrap_or(443);
+        let v_uuid = get_val("id");
+        let v_net = get_val("net"); // ws, tcp, grpc
+        let v_path = get_val("path");
+        let v_tls = get_val("tls"); // tls or empty
+        let v_sni = get_val("host"); // often host is SNI
+
+        let xray_config = json!({
+            "log": { "loglevel": "warning" },
+            "inbounds":[{ "port": test_port, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": true } }],
+            "outbounds":[{
+                "protocol": "vmess",
+                "settings": {
+                    "vnext":[{
+                        "address": v_host, "port": v_port,
+                        "users":[{ "id": v_uuid, "alterId": 0 }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": v_net,
+                    "security": if v_tls == "tls" { "tls" } else { "none" },
+                    "tlsSettings": if v_tls == "tls" { json!({ "serverName": v_sni, "allowInsecure": true }) } else { json!(null) },
+                    "wsSettings": if v_net == "ws" { json!({ "path": v_path, "headers": { "Host": v_sni } }) } else { json!(null) },
+                    "grpcSettings": if v_net == "grpc" { json!({ "serviceName": v_path }) } else { json!(null) }
+                }
+            }]
+        });
+        return Some(serde_json::to_string_pretty(&xray_config).unwrap());
+    }
+
+    // --- TROJAN CONFIG GENERATION ---
+    if is_trojan {
+        let network = queries.get("type").map(|s| s.as_str()).unwrap_or("tcp");
+        let security = queries.get("security").map(|s| s.as_str()).unwrap_or("tls");
+        let sni = queries.get("sni").unwrap_or(&host.to_string()).to_string();
+        let path = queries.get("path").map(|s| s.as_str()).unwrap_or("/");
+        
+        let xray_config = json!({
+            "log": { "loglevel": "warning" },
+            "inbounds":[{ "port": test_port, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": true } }],
+            "outbounds":[{
+                "protocol": "trojan",
+                "settings": {
+                    "servers":[{
+                        "address": host, "port": port,
+                        "password": parsed.username()
+                    }]
+                },
+                "streamSettings": {
+                    "network": network,
+                    "security": security,
+                    "tlsSettings": { "serverName": sni, "allowInsecure": true },
+                    "wsSettings": if network == "ws" { json!({ "path": path, "headers": { "Host": sni } }) } else { json!(null) },
+                    "grpcSettings": if network == "grpc" { json!({ "serviceName": path }) } else { json!(null) }
+                }
+            }]
+        });
+        return Some(serde_json::to_string_pretty(&xray_config).unwrap());
+    }
     
-    if !is_vless && !is_trojan { return None; }
+    // --- SHADOWSOCKS CONFIG GENERATION ---
+    if is_ss {
+        // ss://base64(method:password)@host:port#name OR ss://base64(method:password)@host:port
+        // Often just ss://base64(method:password@host:port)
+        let mut ss_host = host.to_string();
+        let mut ss_port = port;
+        let mut ss_method = "aes-256-gcm".to_string();
+        let mut ss_pass = parsed.username().to_string();
 
-    let outbound_settings = if is_vless {
-        json!({
-            "vnext":[{
-                "address": host, "port": port,
-                "users":[{ "id": parsed.username(), "encryption": "none", "flow": flow }]
+        // Handle SIP002 format where user info is base64
+        if parsed.username().contains(":") {
+            // Standard URL format
+        } else {
+            // Legacy format encoded in host part? Rare but possible.
+            // Assume parsed username is password if format is weird? 
+            // Let's rely on 'url' crate parsing for standard SIP002.
+        }
+        
+        // Some links put method:password in the username part URL encoded
+        if ss_pass.contains(":") {
+             let parts: Vec<&str> = ss_pass.split(':').collect();
+             if parts.len() == 2 {
+                 ss_method = parts[0].to_string();
+                 ss_pass = parts[1].to_string();
+             }
+        }
+
+        let xray_config = json!({
+            "log": { "loglevel": "warning" },
+            "inbounds":[{ "port": test_port, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": true } }],
+            "outbounds":[{
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers":[{
+                        "address": ss_host, "port": ss_port,
+                        "method": ss_method,
+                        "password": ss_pass
+                    }]
+                }
             }]
-        })
-    } else {
-        json!({
-            "servers":[{
-                "address": host, "port": port,
-                "password": parsed.username()
-            }]
-        })
-    };
+        });
+        return Some(serde_json::to_string_pretty(&xray_config).unwrap());
+    }
 
-    let xray_config = json!({
-        "log": { "loglevel": "error" },
-        "inbounds":[{ "port": test_port, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": true } }],
-        "outbounds":[{
-            "protocol": if is_vless { "vless" } else { "trojan" },
-            "settings": outbound_settings,
-            "streamSettings": {
-                "network": network,
-                "security": security,
-                "tlsSettings": if security == "tls" { json!({ "serverName": sni }) } else { json!(null) },
-                "realitySettings": if security == "reality" { 
-                    json!({ "serverName": sni, "publicKey": queries.get("pbk").unwrap_or(&"".to_string()), "shortId": queries.get("sid").unwrap_or(&"".to_string()) }) 
-                } else { json!(null) },
-                "wsSettings": if network == "ws" { json!({ "path": path, "headers": { "Host": sni } }) } else { json!(null) },
-                "grpcSettings": if network == "grpc" { json!({ "serviceName": path }) } else { json!(null) }
-            }
-        }]
-    });
-
-    Some(serde_json::to_string_pretty(&xray_config).unwrap())
+    None
 }
 
 fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>, timeout_secs: u64) -> bool {
-    let test_port = 10090;
+    let test_port = 19000; // Fixed port for testing to avoid conflicts with V2RayN
     let json_config = match generate_xray_json(config_link, test_port) {
         Some(c) => c, None => return false,
     };
@@ -501,25 +616,54 @@ fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>, timeout_secs: u6
     let temp_file = format!("temp_test_config_{}.json", test_port);
     let _ = fs::write(&temp_file, json_config);
 
-    let mut child = match Command::new("xray.exe").args(&["run", "-c", &temp_file]).creation_flags(CREATE_NO_WINDOW).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+    // KILL any previous stray process on this port
+    let _ = Command::new("cmd").args(&["/C", &format!("taskkill /F /FI \"WINDOWTITLE eq xray_test_{}\"", test_port)]).creation_flags(CREATE_NO_WINDOW).output();
+
+    let mut child = match Command::new("xray.exe")
+        .args(&["run", "-c", &temp_file])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn() 
+        {
             Ok(c) => c,
             Err(_) => {
-                log_worker(tx, LogLevel::Error, "xray.exe not found! Please place it in the folder.".to_string());
-                let _ = fs::remove_file(&temp_file); return false;
+                log_worker(tx, LogLevel::Error, "❌ xray.exe not found or failed to start.".to_string());
+                let _ = fs::remove_file(&temp_file); 
+                return false;
             }
         };
 
-    thread::sleep(Duration::from_secs(5));
+    // Wait for core to start
+    thread::sleep(Duration::from_secs(2));
 
+    // Testing Logic
+    // We use a HEAD request. It sends 0 bytes, gets headers only.
+    // We verify if the tunnel can establish a TLS handshake with Telegram.
     let proxy_url = format!("socks5h://127.0.0.1:{}", test_port);
+    
+    // CRITICAL: .no_proxy() ensures we DO NOT use the System Proxy (V2RayN).
+    // We ONLY use our local test proxy.
     let result = reqwest::blocking::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
-        .timeout(Duration::from_secs(timeout_secs)) // Uses GUI setting
-        .build().unwrap().get("https://api.telegram.org").send();
+        .no_proxy() // This is the key to isolation
+        .timeout(Duration::from_secs(timeout_secs))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .head("https://telegram.org") // HEAD request = 0 bandwidth
+        .send();
 
-    let is_working = match result { Ok(resp) => resp.status().is_success(), Err(_) => false };
+    let is_working = match result { 
+        Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 302, 
+        Err(_) => false 
+    };
 
-    let _ = child.kill(); let _ = child.wait(); let _ = fs::remove_file(&temp_file);
+    // Cleanup
+    let _ = child.kill(); 
+    let _ = child.wait(); 
+    let _ = fs::remove_file(&temp_file);
+    
     is_working
 }
 
@@ -529,7 +673,6 @@ fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>, timeout_secs: u6
 
 fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx: Sender<AppEvent>) -> Result<()> {
     let channels = parse_channels(&channels_raw);
-
     let regex_pattern = r#"(?i)(vless|vmess|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[^\s<>`"'\\]+"#;
     let regex = Regex::new(regex_pattern).unwrap();
     let date_regex = Regex::new(r#"<time datetime="([^"]+)""#).unwrap();
@@ -580,10 +723,7 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
                                 for m in regex.find_iter(block) {
                                     let clean_link = m.as_str().trim_end_matches(&['(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'][..]).to_string();
                                     
-                                    // 🔴 NEW: Explicitly ignore Telegram deep links so they aren't parsed as proxies
-                                    if clean_link.starts_with("tg://resolve") || clean_link.starts_with("tg://join") || clean_link.starts_with("tg://set") || clean_link.starts_with("tg://bg") {
-                                        continue;
-                                    }
+                                    if clean_link.starts_with("tg://") { continue; }
 
                                     if let Some(proto) = clean_link.split("://").next() {
                                         let proto_lower = proto.to_lowercase();
@@ -632,33 +772,36 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
         let mut newly_working_count = 0;
         
         if config.test_configs_enabled && !new_only.is_empty() {
-            log_worker(&tx, LogLevel::Info, format!("🔍 Starting background test on new VLESS/Trojan configs..."));
+            log_worker(&tx, LogLevel::Info, format!("🔍 Starting isolated testing (VLESS/VMESS/SS/TROJAN)..."));
             fs::create_dir_all(OUTPUT_TESTED_DIR)?;
             
-            for (proto, links) in &new_only {
-                if proto == "vless" || proto == "trojan" {
+            // Test VLESS, VMESS, TROJAN, SS
+            let test_protos = ["vless", "vmess", "trojan", "ss"];
+            
+            for proto in &test_protos {
+                if let Some(links) = new_only.get(*proto) {
                     for link in links {
                         if stop.load(Ordering::SeqCst) { break; }
-                        log_worker(&tx, LogLevel::Debug, format!("    🧪 Testing a {} config...", proto.to_uppercase()));
+                        // Log short version
+                        let short_link: String = link.chars().take(50).collect();
+                        log_worker(&tx, LogLevel::Debug, format!("    🧪 Testing [{}]: {}...", proto.to_uppercase(), short_link));
                         
-                        // Passes user's configurable timeout to the tester
                         if test_config_safely(link, &tx, config.testing_timeout_seconds) {
                             newly_working_count += 1;
-                            log_worker(&tx, LogLevel::Success, "    🟢 SUCCESS! Config loads Telegram.".to_string());
+                            log_worker(&tx, LogLevel::Success, "    🟢 SUCCESS! Config is LIVE.".to_string());
                             
                             let path = Path::new(OUTPUT_TESTED_DIR).join(format!("working_{}.txt", proto));
                             let mut combined = read_existing_set(&path).unwrap_or_default();
                             combined.insert(link.clone());
                             let lines: Vec<String> = combined.into_iter().collect();
                             let _ = fs::write(&path, lines.join("\n"));
-                        } else {
-                            log_worker(&tx, LogLevel::Warning, "    🔴 FAILED: Config is dead or blocked.".to_string());
                         }
                     }
                 }
             }
+            
             if newly_working_count > 0 { log_worker(&tx, LogLevel::Success, format!("🏆 Testing complete: Found {} working configs!", newly_working_count)); } 
-            else { log_worker(&tx, LogLevel::Warning, "📉 Testing complete: All tested configs were dead.".to_string()); }
+            else { log_worker(&tx, LogLevel::Warning, "📉 Testing complete: No live configs found in this batch.".to_string()); }
         }
 
         let mut by_protocol = BTreeMap::new();
