@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -44,10 +44,10 @@ fn generate_icon() -> egui::IconData {
 
 fn main() {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1050.0, 700.0]).with_min_inner_size([850.0, 550.0]).with_icon(generate_icon()),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1050.0, 700.0]),
         ..Default::default()
     };
-    let _ = eframe::run_native("⚡ Config Collector Pro (Windows Edition)", options, Box::new(|_| Box::new(AppState::bootstrap())));
+    let _ = eframe::run_native("Config Collector", options, Box::new(|_| Box::new(AppState::bootstrap())));
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -492,35 +492,53 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
     Some(serde_json::to_string_pretty(&xray_config).unwrap())
 }
 
-fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>, timeout_secs: u64) -> bool {
+fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>, timeout_secs: u64) -> (bool, String) {
     let test_port = 10090;
-    let json_config = match generate_xray_json(config_link, test_port) {
-        Some(c) => c, None => return false,
+    
+    // Create simple Sing-box outbound config
+    let config_json = json!({
+        "inbounds": [{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": test_port }],
+        "outbounds": [{ "type": "selector", "tag": "proxy", "outbounds": ["urltest"] }, 
+                      { "type": "urltest", "tag": "urltest", "outbounds": ["direct"], "url": config_link }]
+    });
+
+    let temp_file = format!("test_{}.json", test_port);
+    let _ = fs::write(&temp_file, config_json.to_string());
+
+    let mut child = match Command::new("sing-box.exe")
+        .args(&["run", "-c", &temp_file])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(c) => c,
+            Err(_) => { return (false, "sing-box missing".to_string()); }
     };
 
-    let temp_file = format!("temp_test_config_{}.json", test_port);
-    let _ = fs::write(&temp_file, json_config);
+    thread::sleep(Duration::from_secs(3));
 
-    let mut child = match Command::new("xray.exe").args(&["run", "-c", &temp_file]).creation_flags(CREATE_NO_WINDOW).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            Ok(c) => c,
-            Err(_) => {
-                log_worker(tx, LogLevel::Error, "xray.exe not found! Please place it in the folder.".to_string());
-                let _ = fs::remove_file(&temp_file); return false;
-            }
-        };
+    let client = ClientBuilder::new()
+        .proxy(reqwest::Proxy::all(&format!("socks5://127.0.0.1:{}", test_port)).unwrap())
+        .timeout(Duration::from_secs(timeout_secs))
+        .build().unwrap();
 
-    thread::sleep(Duration::from_secs(5));
+    // STAGE 1: Tunnel Test
+    let start = Instant::now();
+    let stage1 = client.get("http://1.1.1.1").send();
+    if stage1.is_err() { 
+        let _ = child.kill(); let _ = fs::remove_file(&temp_file);
+        return (false, "Dead Tunnel".to_string()); 
+    }
 
-    let proxy_url = format!("socks5h://127.0.0.1:{}", test_port);
-    let result = reqwest::blocking::Client::builder()
-        .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
-        .timeout(Duration::from_secs(timeout_secs)) // Uses GUI setting
-        .build().unwrap().get("https://api.telegram.org").send();
+    // STAGE 2: Bypass Test
+    let stage2 = client.get("https://api.telegram.org").send();
+    let elapsed = start.elapsed().as_millis();
+    
+    let _ = child.kill(); let _ = fs::remove_file(&temp_file);
 
-    let is_working = match result { Ok(resp) => resp.status().is_success(), Err(_) => false };
-
-    let _ = child.kill(); let _ = child.wait(); let _ = fs::remove_file(&temp_file);
-    is_working
+    if stage2.is_ok() && stage2.unwrap().status().is_success() {
+        return (true, format!("Working ({}ms)", elapsed));
+    } else {
+        return (false, "Blacklisted".to_string());
+    }
 }
 
 // =============================================================
