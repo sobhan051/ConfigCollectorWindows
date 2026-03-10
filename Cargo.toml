@@ -1,15 +1,16 @@
 [package]
 name = "config_collector"
 version = "0.1.0"
-edition = "2021"[dependencies]
+edition = "2021"
+
+[dependencies]
 eframe = "0.27"
 egui = "0.27"
 chrono = "0.4"
 regex = "1.10"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features =["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 anyhow = "1.0"
 url = "2.5"
-# Reqwest with socks proxy and trust-dns enabled for DPI bypass
 reqwest = { version = "0.12", features = ["blocking", "socks", "trust-dns", "rustls-tls-native-roots"] }
