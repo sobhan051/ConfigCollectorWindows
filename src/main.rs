@@ -10,6 +10,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
+use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -50,7 +51,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default().with_inner_size([1050.0, 700.0]).with_min_inner_size([850.0, 550.0]).with_icon(generate_icon()),
         ..Default::default()
     };
-    let _ = eframe::run_native("⚡ Config Collector Pro (Isolated Tester)", options, Box::new(|_| Box::new(AppState::bootstrap())));
+    let _ = eframe::run_native("⚡ Config Collector Pro (Parallel Engine)", options, Box::new(|_| Box::new(AppState::bootstrap())));
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -94,7 +95,7 @@ impl Default for AppConfig {
             proxy_type: ProxyType::Http, proxy_host: "127.0.0.1".to_string(), proxy_port: 10880,
             performance: PerformanceProfile::MediumPC, ignore_ssl_errors: true, remote_dns: true,
             output_new_only_enabled: true, output_append_unique_enabled: true, test_configs_enabled: true, 
-            testing_timeout_seconds: 20, 
+            testing_timeout_seconds: 15, 
             protocol_rules,
         }
     }
@@ -104,7 +105,7 @@ impl AppConfig {
     fn load_or_create() -> Self {
         if let Ok(raw) = fs::read_to_string(APP_CONFIG_PATH) {
             if let Ok(mut cfg) = toml::from_str::<Self>(&raw) {
-                if cfg.testing_timeout_seconds == 0 { cfg.testing_timeout_seconds = 20; }
+                if cfg.testing_timeout_seconds == 0 { cfg.testing_timeout_seconds = 15; }
                 for p in DEFAULT_PROTOCOLS { cfg.protocol_rules.entry(p.to_string()).or_insert(ProtocolRule { enabled: true, max_count: 500 }); }
                 return cfg;
             }
@@ -165,7 +166,7 @@ impl AppState {
         let mut state = Self {
             config: AppConfig::load_or_create(), channels_text: fs::read_to_string(CHANNELS_PATH).unwrap_or_else(|_| "IranProxyPlus\nfilembad".to_string()),
             active_tab: 0, proxy_access_status: "Awaiting test...".to_string(), proxy_access_ok: None,
-            logs: vec![LogMessage { time: Local::now().format("%H:%M:%S").to_string(), level: LogLevel::Info, text: "🖥️ System Boot: Isolated Core Active.".to_string() }],
+            logs: vec![LogMessage { time: Local::now().format("%H:%M:%S").to_string(), level: LogLevel::Info, text: "🖥️ System Boot: Parallel Engine Ready.".to_string() }],
             total_configs: 0, working_configs: 0, by_protocol: BTreeMap::new(), running: false, stop_flag: Arc::new(AtomicBool::new(false)), worker_handle: None, event_tx: tx, event_rx: rx,
         };
         state.test_connection();
@@ -206,7 +207,7 @@ impl AppState {
 
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        self.add_log(LogLevel::Warning, "🛑 Stop signal sent. Wrapping up current task safely...".to_string());
+        self.add_log(LogLevel::Warning, "🛑 Stop signal sent. Wrapping up...".to_string());
     }
 
     fn add_log(&mut self, level: LogLevel, text: String) { self.logs.push(LogMessage { time: Local::now().format("%H:%M:%S").to_string(), level, text }); }
@@ -226,7 +227,6 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        // Cleanup any stray xray processes
         let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM xray.exe"]).creation_flags(CREATE_NO_WINDOW).output();
     }
 }
@@ -235,7 +235,6 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events(); 
         
-        // Dark Theme
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::from_rgb(13, 15, 23); visuals.window_fill = egui::Color32::from_rgb(18, 20, 30);
         ctx.set_visuals(visuals);
@@ -429,7 +428,6 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
 // ISOLATED XRAY TESTER (VLESS, VMESS, SS, TROJAN)
 // =============================================================
 
-// Simple Base64 decoder to avoid adding dependencies
 fn decode_base64(input: &str) -> String {
     let mut clean = input.replace('-', "+").replace('_', "/");
     while clean.len() % 4 != 0 { clean.push('='); }
@@ -488,12 +486,9 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
 
     // --- VMESS CONFIG GENERATION ---
     if is_vmess {
-        // VMess links are typically base64 encoded JSON after vmess://
         let b64_content = link.strip_prefix("vmess://")?;
         let json_str = decode_base64(b64_content);
-        // Parse the inner VMess JSON (simplified parser for common fields)
-        // Example: {"add":"ip","port":"443","id":"uuid","net":"ws","type":"none","host":"host","path":"/","tls":"tls"}
-        // We just naively parse or use regex. Let's use regex for safety in Rust.
+        
         let get_val = |key: &str| -> String {
             let re = Regex::new(&format!(r#""{}"\s*:\s*"([^"]+)""#, key)).unwrap();
             re.captures(&json_str).map(|c| c[1].to_string()).unwrap_or_default()
@@ -502,10 +497,10 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
         let v_host = get_val("add");
         let v_port: u16 = get_val("port").parse().ok().unwrap_or(443);
         let v_uuid = get_val("id");
-        let v_net = get_val("net"); // ws, tcp, grpc
+        let v_net = get_val("net");
         let v_path = get_val("path");
-        let v_tls = get_val("tls"); // tls or empty
-        let v_sni = get_val("host"); // often host is SNI
+        let v_tls = get_val("tls");
+        let v_sni = get_val("host");
 
         let xray_config = json!({
             "log": { "loglevel": "warning" },
@@ -562,23 +557,11 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
     
     // --- SHADOWSOCKS CONFIG GENERATION ---
     if is_ss {
-        // ss://base64(method:password)@host:port#name OR ss://base64(method:password)@host:port
-        // Often just ss://base64(method:password@host:port)
         let mut ss_host = host.to_string();
         let mut ss_port = port;
         let mut ss_method = "aes-256-gcm".to_string();
         let mut ss_pass = parsed.username().to_string();
 
-        // Handle SIP002 format where user info is base64
-        if parsed.username().contains(":") {
-            // Standard URL format
-        } else {
-            // Legacy format encoded in host part? Rare but possible.
-            // Assume parsed username is password if format is weird? 
-            // Let's rely on 'url' crate parsing for standard SIP002.
-        }
-        
-        // Some links put method:password in the username part URL encoded
         if ss_pass.contains(":") {
              let parts: Vec<&str> = ss_pass.split(':').collect();
              if parts.len() == 2 {
@@ -607,64 +590,77 @@ fn generate_xray_json(link: &str, test_port: u16) -> Option<String> {
     None
 }
 
-fn test_config_safely(config_link: &str, tx: &Sender<AppEvent>, timeout_secs: u64) -> bool {
-    let test_port = 19000; // Fixed port for testing to avoid conflicts with V2RayN
-    let json_config = match generate_xray_json(config_link, test_port) {
-        Some(c) => c, None => return false,
-    };
+// PARALLEL TESTER: 1-BYTE RANGE REQUEST + PORT KNOCKING
+fn test_single_config_isolated(config_link: String, test_port: u16, timeout_secs: u64) -> Option<String> {
+    // 1. Generate Config
+    let json_config = generate_xray_json(&config_link, test_port)?;
+    let temp_file = format!("temp_test_{}.json", test_port);
+    
+    if let Err(_) = fs::write(&temp_file, json_config) {
+        return None;
+    }
 
-    let temp_file = format!("temp_test_config_{}.json", test_port);
-    let _ = fs::write(&temp_file, json_config);
-
-    // KILL any previous stray process on this port
-    let _ = Command::new("cmd").args(&["/C", &format!("taskkill /F /FI \"WINDOWTITLE eq xray_test_{}\"", test_port)]).creation_flags(CREATE_NO_WINDOW).output();
-
+    // 2. Spawn Xray Process
     let mut child = match Command::new("xray.exe")
         .args(&["run", "-c", &temp_file])
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn() 
-        {
-            Ok(c) => c,
-            Err(_) => {
-                log_worker(tx, LogLevel::Error, "❌ xray.exe not found or failed to start.".to_string());
-                let _ = fs::remove_file(&temp_file); 
-                return false;
-            }
-        };
+    {
+        Ok(c) => c,
+        Err(_) => { let _ = fs::remove_file(&temp_file); return None; }
+    };
 
-    // Wait for core to start
-    thread::sleep(Duration::from_secs(2));
-
-    // Testing Logic
-    // We use a HEAD request. It sends 0 bytes, gets headers only.
-    // We verify if the tunnel can establish a TLS handshake with Telegram.
-    let proxy_url = format!("socks5h://127.0.0.1:{}", test_port);
+    // 3. PORT KNOCKING (Active Wait)
+    // Instead of sleeping 5s, we check every 50ms if the port is open.
+    let start = Instant::now();
+    let mut port_ready = false;
     
-    // CRITICAL: .no_proxy() ensures we DO NOT use the System Proxy (V2RayN).
-    // We ONLY use our local test proxy.
-    let result = reqwest::blocking::Client::builder()
-        .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
-        .no_proxy() // This is the key to isolation
+    while start.elapsed().as_secs() < 4 { 
+        if TcpStream::connect(format!("127.0.0.1:{}", test_port)).is_ok() {
+            port_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if !port_ready {
+        let _ = child.kill();
+        let _ = fs::remove_file(&temp_file);
+        return None;
+    }
+
+    // 4. THE 1-BYTE TEST
+    // We request only 1 byte to verify data transfer works without wasting bandwidth.
+    let proxy_str = format!("socks5h://127.0.0.1:{}", test_port);
+    
+    let result = ClientBuilder::new()
+        .proxy(reqwest::Proxy::all(&proxy_str).ok()?)
+        .no_proxy() // CRITICAL: Isolate from system proxy
         .timeout(Duration::from_secs(timeout_secs))
         .danger_accept_invalid_certs(true)
         .build()
-        .unwrap()
-        .head("https://telegram.org") // HEAD request = 0 bandwidth
+        .ok()?
+        .get("https://www.google.com/favicon.ico")
+        .header("Range", "bytes=0-0") // Request exactly 1 byte
         .send();
 
-    let is_working = match result { 
-        Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 302, 
-        Err(_) => false 
+    // Check for 206 Partial Content or 200 OK
+    let is_success = match result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            status == 206 || status == 200
+        },
+        Err(_) => false,
     };
 
-    // Cleanup
-    let _ = child.kill(); 
-    let _ = child.wait(); 
+    // 5. Cleanup
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = fs::remove_file(&temp_file);
-    
-    is_working
+
+    if is_success { Some(config_link) } else { None }
 }
 
 // =============================================================
@@ -772,36 +768,74 @@ fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx
         let mut newly_working_count = 0;
         
         if config.test_configs_enabled && !new_only.is_empty() {
-            log_worker(&tx, LogLevel::Info, format!("🔍 Starting isolated testing (VLESS/VMESS/SS/TROJAN)..."));
+            log_worker(&tx, LogLevel::Info, "🚀 Starting Parallel Testing Engine...".to_string());
             fs::create_dir_all(OUTPUT_TESTED_DIR)?;
             
-            // Test VLESS, VMESS, TROJAN, SS
             let test_protos = ["vless", "vmess", "trojan", "ss"];
-            
+            let mut all_to_test: Vec<String> = Vec::new();
+
+            // Gather all candidates
             for proto in &test_protos {
                 if let Some(links) = new_only.get(*proto) {
-                    for link in links {
-                        if stop.load(Ordering::SeqCst) { break; }
-                        // Log short version
-                        let short_link: String = link.chars().take(50).collect();
-                        log_worker(&tx, LogLevel::Debug, format!("    🧪 Testing [{}]: {}...", proto.to_uppercase(), short_link));
-                        
-                        if test_config_safely(link, &tx, config.testing_timeout_seconds) {
-                            newly_working_count += 1;
-                            log_worker(&tx, LogLevel::Success, "    🟢 SUCCESS! Config is LIVE.".to_string());
-                            
-                            let path = Path::new(OUTPUT_TESTED_DIR).join(format!("working_{}.txt", proto));
-                            let mut combined = read_existing_set(&path).unwrap_or_default();
-                            combined.insert(link.clone());
-                            let lines: Vec<String> = combined.into_iter().collect();
-                            let _ = fs::write(&path, lines.join("\n"));
-                        }
-                    }
+                    for link in links { all_to_test.push(link.clone()); }
                 }
             }
-            
-            if newly_working_count > 0 { log_worker(&tx, LogLevel::Success, format!("🏆 Testing complete: Found {} working configs!", newly_working_count)); } 
-            else { log_worker(&tx, LogLevel::Warning, "📉 Testing complete: No live configs found in this batch.".to_string()); }
+
+            if !all_to_test.is_empty() {
+                let total_jobs = all_to_test.len();
+                log_worker(&tx, LogLevel::Info, format!("    🔄 Spawning threads for {} configs...", total_jobs));
+
+                let chunk_size = 10; // Test 10 configs at once
+                let mut working_links: Vec<String> = Vec::new();
+                
+                for (idx, chunk) in all_to_test.chunks(chunk_size).enumerate() {
+                    if stop.load(Ordering::SeqCst) { break; }
+
+                    // Scoped threads for parallel execution
+                    let results: Vec<Option<String>> = std::thread::scope(|s| {
+                        let mut handles = vec![];
+                        
+                        for (i, link) in chunk.iter().enumerate() {
+                            let port = 20001 + (i as u16); // Unique port per thread
+                            let link_clone = link.clone();
+                            let timeout = config.testing_timeout_seconds;
+
+                            handles.push(s.spawn(move || {
+                                test_single_config_isolated(link_clone, port, timeout)
+                            }));
+                        }
+
+                        handles.into_iter().map(|h| h.join().unwrap_or(None)).collect()
+                    });
+
+                    // Collect working links
+                    for res in results {
+                        if let Some(good_link) = res {
+                            working_links.push(good_link);
+                        }
+                    }
+
+                    let processed = std::cmp::min((idx + 1) * chunk_size, total_jobs);
+                    log_worker(&tx, LogLevel::Debug, format!("    ⏳ Progress: {}/{} tested...", processed, total_jobs));
+                }
+
+                // Save working configs
+                if !working_links.is_empty() {
+                    newly_working_count = working_links.len();
+                    log_worker(&tx, LogLevel::Success, format!("    🏆 Found {} working configs!", newly_working_count));
+                    
+                    for link in working_links {
+                        let proto = link.split("://").next().unwrap_or("misc");
+                        let path = Path::new(OUTPUT_TESTED_DIR).join(format!("working_{}.txt", proto));
+                        let mut set = read_existing_set(&path).unwrap_or_default();
+                        set.insert(link);
+                        let lines: Vec<String> = set.into_iter().collect();
+                        let _ = fs::write(&path, lines.join("\n"));
+                    }
+                } else {
+                    log_worker(&tx, LogLevel::Warning, "    📉 No working configs in this batch.".to_string());
+                }
+            }
         }
 
         let mut by_protocol = BTreeMap::new();
