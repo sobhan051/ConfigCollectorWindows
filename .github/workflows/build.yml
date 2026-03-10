@@ -1,0 +1,26 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      
+    - name: Build the Project
+      run: cargo build --release
+      
+    - name: Upload EXE file
+      uses: actions/upload-artifact@v4
+      with:
+        name: config_collector_windows
+        path: target/release/config_collector.exe
