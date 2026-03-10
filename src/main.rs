@@ -7,7 +7,7 @@ use regex::Regex;
 use reqwest::blocking::ClientBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
