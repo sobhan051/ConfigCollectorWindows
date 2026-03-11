@@ -1,13 +1,3 @@
-Here is the **complete, fixed, and optimized code**.
-
-I have applied three critical fixes to your version:
-1.  **Correct Chaining Logic:** Changed `proxySettings` to `detour` inside the JSON config. This is required for Xray to actually route traffic through your Psiphon.
-2.  **Safety:** Removed the global `taskkill xray.exe` command. This ensures the software never kills your active V2rayN/Psiphon connection.
-3.  **Speed:** Added "Port Knocking" to detect when Xray is ready, removing the need for a long 8-second sleep.
-
-### `src/main.rs`
-
-```rust
 #![windows_subsystem = "windows"]
 
 use anyhow::Result;
@@ -1005,4 +995,3 @@ fn parse_channels(raw: &str) -> Vec<String> {
         Some(line.to_string())
     }).filter(|s| !s.is_empty()).collect()
 }
-```
