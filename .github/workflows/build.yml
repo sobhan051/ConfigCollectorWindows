@@ -22,5 +22,5 @@ jobs:
     - name: Upload EXE file
       uses: actions/upload-artifact@v4
       with:
-        name: config_collector_windows
-        path: target/release/config_collector.exe
+        name: config-collector-windows
+        path: target/release/config-collector.exe
