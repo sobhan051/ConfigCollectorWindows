@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;                    // ← THIS LINE WAS MISSING (this fixes the error)
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use eframe::egui;
 use regex::Regex;
