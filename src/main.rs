@@ -193,10 +193,10 @@ impl AppConfig {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct SentHistory { 
-    #[serde(with = "chrono::serde::ts_seconds_option")]
+struct SentHistory {
+    #[serde(with = "chrono::serde::ts_seconds")]  // ← Changed here
     sent_at: BTreeMap<String, DateTime<Utc>>,
-    #[serde(with = "chrono::serde::ts_seconds_option")]
+    #[serde(with = "chrono::serde::ts_seconds")]  // ← Changed here
     tested_at: BTreeMap<String, DateTime<Utc>>,
 }
 
@@ -1102,7 +1102,7 @@ fn tier2_full_test(
     config: &AppConfig,
     tx: &Sender<AppEvent>
 ) -> TestResult {
-    let start_time = Instant::now();
+    let _start_time = Instant::now();
     let endpoint = format!("{}:{}", parsed.host, parsed.port);
 
     let xray_json = match generate_xray_config(
