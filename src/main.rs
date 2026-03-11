@@ -756,22 +756,26 @@ fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
 
 fn test_psiphon_alone(config: &AppConfig) -> Result<String> {
     let proxy_url = format!("http://{}:{}", config.psiphon_http_host, config.psiphon_http_port);
-
     let client = ClientBuilder::new()
         .timeout(Duration::from_secs(30))
         .proxy(reqwest::Proxy::all(&proxy_url)?)
         .danger_accept_invalid_certs(true)
         .build()?;
 
-    let start = Instant::now();
-    let resp = client.get(PSIPHON_TEST_URL).send()?;
-    let elapsed = start.elapsed().as_millis();
-
-    if resp.status().is_success() || resp.status().as_u16() == 400 {
-        Ok(format!("Connected ({}ms)", elapsed))
-    } else {
-        Err(anyhow::anyhow!("HTTP {}", resp.status()))
+    // Try primary URL, fallback to secondary
+    let test_urls = [
+        "https://www.google.com/generate_204",
+        "https://1.1.1.1/cdn-cgi/trace",
+    ];
+    
+    for url in test_urls {
+        if let Ok(resp) = client.get(url).send() {
+            if resp.status().is_success() || resp.status().as_u16() == 204 {
+                return Ok(format!("Connected ({})", url));
+            }
+        }
     }
+    Err(anyhow::anyhow!("All test URLs failed"))
 }
 
 fn extract_endpoint(link: &str) -> Option<String> {
