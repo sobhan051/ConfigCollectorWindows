@@ -1,16 +1,17 @@
 #![windows_subsystem = "windows"]
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
-use base64::Engine;                    // ← THIS LINE WAS MISSING (this fixes the error)
+use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use eframe::egui;
 use regex::Regex;
 use reqwest::blocking::ClientBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -25,45 +26,17 @@ const APP_CONFIG_PATH: &str = "config/app_config.toml";
 const CHANNELS_PATH: &str = "config/channels.txt";
 const OUTPUT_NEW_DIR: &str = "output/new_only";
 const OUTPUT_APPEND_DIR: &str = "output/append_unique";
-const OUTPUT_TESTED_DIR: &str = "output/tested_working";
+const OUTPUT_WORKING_DIR: &str = "output/working_pool";
+const HOT_POOL_PATH: &str = "output/hot_pool.json";
 const HISTORY_PATH: &str = "output/sent_history.json";
+const PSIPHON_TEST_URL: &str = "http://149.154.167.91:443"; // Telegram DC IP
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const DEFAULT_PROTOCOLS: [&str; 27] = [
-    "vmess", "vless", "trojan", "ss", "ssr", "tuic", "hysteria", "hysteria2", "hy2", "juicity",
-    "snell", "anytls", "ssh", "wireguard", "wg", "warp", "socks", "socks4", "socks5", "tg", "dns",
-    "nm-dns", "nm-vless", "slipnet-enc", "slipnet", "slipstream", "dnstt",
-];
+const DEFAULT_PROTOCOLS: [&str; 4] = ["vless", "vmess", "trojan", "ss"];
 
-fn generate_icon() -> egui::IconData {
-    let width = 32;
-    let height = 32;
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for _y in 0..height {
-        for _x in 0..width {
-            rgba.push(30);
-            rgba.push(160);
-            rgba.push(100);
-            rgba.push(255);
-        }
-    }
-    egui::IconData { rgba, width, height }
-}
-
-fn main() {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1050.0, 700.0])
-            .with_min_inner_size([850.0, 550.0])
-            .with_icon(generate_icon()),
-        ..Default::default()
-    };
-    let _ = eframe::run_native(
-        "⚡ Config Collector Pro (Chained Tester)",
-        options,
-        Box::new(|_| Box::new(AppState::bootstrap())),
-    );
-}
+// =============================================================
+// DATA STRUCTURES
+// =============================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum ScrapingEngine { RealBrowser, Reqwest }
@@ -71,11 +44,77 @@ enum ScrapingEngine { RealBrowser, Reqwest }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum ProxyType { None, System, Http, Socks5 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-enum PerformanceProfile { WeakPC, MediumPC, StrongPC }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProtocolRule { enabled: bool, max_count: usize }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HotPoolEntry {
+    link: String,
+    last_tested: DateTime<Utc>,
+    success_count: u32,
+    fail_count: u32,
+    avg_connect_time_secs: f64,
+    endpoint: String, // IP:Port fingerprint
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HotPool {
+    entries: Vec<HotPoolEntry>,
+}
+
+impl HotPool {
+    fn load() -> Self {
+        if let Ok(raw) = fs::read_to_string(HOT_POOL_PATH) {
+            if let Ok(v) = serde_json::from_str::<Self>(&raw) { return v; }
+        }
+        Self { entries: vec![] }
+    }
+
+    fn save(&self) -> Result<()> {
+        if let Some(parent) = Path::new(HOT_POOL_PATH).parent() { fs::create_dir_all(parent)?; }
+        fs::write(HOT_POOL_PATH, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    fn get_working(&self, max_age_mins: i64) -> Vec<HotPoolEntry> {
+        let threshold = Utc::now() - ChronoDuration::minutes(max_age_mins);
+        self.entries.iter()
+            .filter(|e| e.last_tested > threshold && e.fail_count == 0)
+            .cloned()
+            .collect()
+    }
+
+    fn update_or_add(&mut self, link: &str, endpoint: &str, success: bool, connect_time: f64) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.link == link) {
+            entry.last_tested = Utc::now();
+            if success {
+                entry.success_count += 1;
+                entry.avg_connect_time_secs = (entry.avg_connect_time_secs + connect_time) / 2.0;
+            } else {
+                entry.fail_count += 1;
+            }
+        } else {
+            self.entries.push(HotPoolEntry {
+                link: link.to_string(),
+                last_tested: Utc::now(),
+                success_count: if success { 1 } else { 0 },
+                fail_count: if success { 0 } else { 1 },
+                avg_connect_time_secs: connect_time,
+                endpoint: endpoint.to_string(),
+            });
+        }
+        // Keep only last 500 entries
+        if self.entries.len() > 500 {
+            self.entries.sort_by(|a, b| b.last_tested.cmp(&a.last_tested));
+            self.entries.truncate(500);
+        }
+    }
+
+    fn is_endpoint_tested_recently(&self, endpoint: &str, mins: i64) -> bool {
+        let threshold = Utc::now() - ChronoDuration::minutes(mins);
+        self.entries.iter().any(|e| e.endpoint == endpoint && e.last_tested > threshold && e.success_count > 0)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -84,17 +123,18 @@ struct AppConfig {
     max_pages_per_channel: usize,
     lookback_days: i64,
     engine: ScrapingEngine,
-    proxy_type: ProxyType,
-    proxy_host: String,
-    proxy_port: u16,
-    performance: PerformanceProfile,
-    ignore_ssl_errors: bool,
-    remote_dns: bool,
+    psiphon_http_host: String,
+    psiphon_http_port: u16,
+    performance: String,
     output_new_only_enabled: bool,
     output_append_unique_enabled: bool,
     test_configs_enabled: bool,
     testing_timeout_seconds: u64,
     max_concurrent_tests: usize,
+    tier1_timeout_seconds: u64,
+    tier2_timeout_seconds: u64,
+    psiphon_health_check_interval_secs: u64,
+    min_bytes_for_success: usize,
     protocol_rules: BTreeMap<String, ProtocolRule>,
 }
 
@@ -102,24 +142,25 @@ impl Default for AppConfig {
     fn default() -> Self {
         let mut protocol_rules = BTreeMap::new();
         for p in DEFAULT_PROTOCOLS {
-            protocol_rules.insert(p.to_string(), ProtocolRule { enabled: true, max_count: 500 });
+            protocol_rules.insert(p.to_string(), ProtocolRule { enabled: true, max_count: 100 });
         }
         Self {
             interval_minutes: 15,
             max_pages_per_channel: 2,
             lookback_days: 2,
             engine: ScrapingEngine::Reqwest,
-            proxy_type: ProxyType::Http,
-            proxy_host: "127.0.0.1".to_string(),
-            proxy_port: 10880,
-            performance: PerformanceProfile::MediumPC,
-            ignore_ssl_errors: true,
-            remote_dns: true,
+            psiphon_http_host: "127.0.0.1".to_string(),
+            psiphon_http_port: 10880,
+            performance: "low_bandwidth".to_string(),
             output_new_only_enabled: true,
             output_append_unique_enabled: true,
             test_configs_enabled: true,
-            testing_timeout_seconds: 150,
-            max_concurrent_tests: 3,
+            testing_timeout_seconds: 120,
+            max_concurrent_tests: 2, // Low bandwidth: max 2 concurrent
+            tier1_timeout_seconds: 15,
+            tier2_timeout_seconds: 90,
+            psiphon_health_check_interval_secs: 120,
+            min_bytes_for_success: 100, // At least 100 bytes transferred
             protocol_rules,
         }
     }
@@ -129,10 +170,13 @@ impl AppConfig {
     fn load_or_create() -> Self {
         if let Ok(raw) = fs::read_to_string(APP_CONFIG_PATH) {
             if let Ok(mut cfg) = toml::from_str::<Self>(&raw) {
-                if cfg.testing_timeout_seconds == 0 { cfg.testing_timeout_seconds = 150; }
-                if cfg.max_concurrent_tests == 0 { cfg.max_concurrent_tests = 3; }
+                // Validation
+                if cfg.testing_timeout_seconds == 0 { cfg.testing_timeout_seconds = 120; }
+                if cfg.max_concurrent_tests == 0 { cfg.max_concurrent_tests = 2; }
+                if cfg.tier1_timeout_seconds == 0 { cfg.tier1_timeout_seconds = 15; }
+                if cfg.tier2_timeout_seconds == 0 { cfg.tier2_timeout_seconds = 90; }
                 for p in DEFAULT_PROTOCOLS {
-                    cfg.protocol_rules.entry(p.to_string()).or_insert(ProtocolRule { enabled: true, max_count: 500 });
+                    cfg.protocol_rules.entry(p.to_string()).or_insert(ProtocolRule { enabled: true, max_count: 100 });
                 }
                 return cfg;
             }
@@ -141,6 +185,7 @@ impl AppConfig {
         let _ = cfg.save();
         cfg
     }
+
     fn save(&self) -> Result<()> {
         if let Some(parent) = Path::new(APP_CONFIG_PATH).parent() { fs::create_dir_all(parent)?; }
         fs::write(APP_CONFIG_PATH, toml::to_string_pretty(self)?)?;
@@ -149,7 +194,10 @@ impl AppConfig {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct SentHistory { sent_at: BTreeMap<String, DateTime<Utc>> }
+struct SentHistory { 
+    sent_at: BTreeMap<String, DateTime<Utc>>,
+    tested_at: BTreeMap<String, DateTime<Utc>>,
+}
 
 impl SentHistory {
     fn load() -> Self {
@@ -158,14 +206,29 @@ impl SentHistory {
         }
         Self::default()
     }
+
     fn prune(&mut self, lookback_days: i64) {
         let threshold = Utc::now() - ChronoDuration::days(lookback_days.max(1));
         self.sent_at.retain(|_, ts| *ts >= threshold);
+        self.tested_at.retain(|_, ts| *ts >= threshold);
     }
+
     fn save(&self) -> Result<()> {
         if let Some(parent) = Path::new(HISTORY_PATH).parent() { fs::create_dir_all(parent)?; }
         fs::write(HISTORY_PATH, serde_json::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    fn mark_tested(&mut self, link: &str) {
+        self.tested_at.insert(link.to_string(), Utc::now());
+    }
+
+    fn was_tested_recently(&self, link: &str, mins: i64) -> bool {
+        if let Some(ts) = self.tested_at.get(link) {
+            *ts > Utc::now() - ChronoDuration::minutes(mins)
+        } else {
+            false
+        }
     }
 }
 
@@ -178,10 +241,26 @@ struct LogMessage { time: String, level: LogLevel, text: String }
 #[derive(Clone, Debug)]
 enum AppEvent {
     Log(LogLevel, String),
-    Stats { total: usize, working: usize, by_protocol: BTreeMap<String, usize> },
+    Stats { total: usize, working: usize, by_protocol: BTreeMap<String, usize>, hot_pool_size: usize },
     PingResult { ok: bool, detail: String },
+    PsiphonHealth { ok: bool, detail: String },
     WorkerStopped,
+    TestingProgress { current: usize, total: usize },
 }
+
+#[derive(Clone, Debug)]
+struct TestResult {
+    link: String,
+    endpoint: String,
+    success: bool,
+    connect_time_secs: f64,
+    bytes_transferred: usize,
+    error: Option<String>,
+}
+
+// =============================================================
+// APP STATE
+// =============================================================
 
 struct AppState {
     config: AppConfig,
@@ -189,15 +268,20 @@ struct AppState {
     active_tab: usize,
     proxy_access_status: String,
     proxy_access_ok: Option<bool>,
+    psiphon_health_ok: Option<bool>,
+    psiphon_health_detail: String,
     logs: Vec<LogMessage>,
     total_configs: usize,
     working_configs: usize,
     by_protocol: BTreeMap<String, usize>,
+    hot_pool_size: usize,
+    testing_progress: Option<(usize, usize)>,
     running: bool,
     stop_flag: Arc<AtomicBool>,
     worker_handle: Option<thread::JoinHandle<()>>,
     event_tx: Sender<AppEvent>,
     event_rx: Receiver<AppEvent>,
+    last_psiphon_check: Instant,
 }
 
 impl AppState {
@@ -209,21 +293,27 @@ impl AppState {
             active_tab: 0,
             proxy_access_status: "Awaiting test...".to_string(),
             proxy_access_ok: None,
+            psiphon_health_ok: None,
+            psiphon_health_detail: "Not checked".to_string(),
             logs: vec![LogMessage {
                 time: Local::now().format("%H:%M:%S").to_string(),
                 level: LogLevel::Info,
-                text: "🖥️ System Boot: Chained tester + concurrent support loaded.".to_string(),
+                text: "🖥️ System Boot: Low-bandwidth optimized tester loaded.".to_string(),
             }],
             total_configs: 0,
             working_configs: 0,
             by_protocol: BTreeMap::new(),
+            hot_pool_size: 0,
+            testing_progress: None,
             running: false,
             stop_flag: Arc::new(AtomicBool::new(false)),
             worker_handle: None,
             event_tx: tx,
             event_rx: rx,
+            last_psiphon_check: Instant::now() - Duration::from_secs(300),
         };
         state.test_connection();
+        state.check_psiphon_health();
         state
     }
 
@@ -252,12 +342,29 @@ impl AppState {
         });
     }
 
+    fn check_psiphon_health(&mut self) {
+        if self.last_psiphon_check.elapsed().as_secs() < 60 {
+            return; // Don't check too frequently
+        }
+        self.last_psiphon_check = Instant::now();
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        thread::spawn(move || {
+            let result = test_psiphon_alone(&config);
+            let _ = tx.send(AppEvent::PsiphonHealth { 
+                ok: result.is_ok(), 
+                detail: result.unwrap_or_else(|e| e.to_string()) 
+            });
+        });
+    }
+
     fn start(&mut self) {
         if self.running { return; }
         let _ = fs::write(CHANNELS_PATH, &self.channels_text);
         let _ = self.config.save();
         self.stop_flag.store(false, Ordering::SeqCst);
         self.running = true;
+        self.testing_progress = None;
         let tx = self.event_tx.clone();
         let cfg = self.config.clone();
         let channels_raw = self.channels_text.clone();
@@ -272,7 +379,7 @@ impl AppState {
 
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        self.add_log(LogLevel::Warning, "🛑 Stop signal sent. Wrapping up current task safely...".to_string());
+        self.add_log(LogLevel::Warning, "🛑 Stop signal sent. Wrapping up safely...".to_string());
     }
 
     fn add_log(&mut self, level: LogLevel, text: String) {
@@ -283,18 +390,32 @@ impl AppState {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 AppEvent::Log(level, msg) => self.add_log(level, msg),
-                AppEvent::Stats { total, working, by_protocol } => {
+                AppEvent::Stats { total, working, by_protocol, hot_pool_size } => {
                     self.total_configs += total;
-                    self.working_configs += working;
+                    self.working_configs = working;
                     self.by_protocol = by_protocol;
+                    self.hot_pool_size = hot_pool_size;
                 }
                 AppEvent::PingResult { ok, detail } => {
                     self.proxy_access_ok = Some(ok);
                     self.proxy_access_status = detail;
                 }
+                AppEvent::PsiphonHealth { ok, detail } => {
+                    self.psiphon_health_ok = Some(ok);
+                    self.psiphon_health_detail = detail;
+                    if !ok {
+                        self.add_log(LogLevel::Error, format!("🚨 Psiphon Health Check Failed: {}", detail));
+                    } else {
+                        self.add_log(LogLevel::Success, format!("✅ Psiphon Healthy: {}", detail));
+                    }
+                }
+                AppEvent::TestingProgress { current, total } => {
+                    self.testing_progress = Some((current, total));
+                }
                 AppEvent::WorkerStopped => {
                     self.running = false;
-                    self.add_log(LogLevel::Warning, "💤 Worker thread successfully terminated.".to_string());
+                    self.testing_progress = None;
+                    self.add_log(LogLevel::Warning, "💤 Worker thread terminated.".to_string());
                 }
             }
         }
@@ -304,11 +425,44 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM msedge.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
-        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM chrome.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
-        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM xray.exe /FI \"WINDOWTITLE eq \""]).creation_flags(CREATE_NO_WINDOW).output();
+        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM xray.exe 2>nul"]).creation_flags(CREATE_NO_WINDOW).output();
     }
 }
+
+fn generate_icon() -> egui::IconData {
+    let width = 32;
+    let height = 32;
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for _y in 0..height {
+        for _x in 0..width {
+            rgba.push(30);
+            rgba.push(160);
+            rgba.push(100);
+            rgba.push(255);
+        }
+    }
+    egui::IconData { rgba, width, height }
+}
+
+fn main() {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_min_inner_size([900.0, 600.0])
+            .with_icon(generate_icon()),
+        ..Default::default()
+    };
+    let _ = eframe::run_native(
+        "⚡ Config Collector Pro (Low-Bandwidth Optimized)",
+        options,
+        Box::new(|_| Box::new(AppState::bootstrap())),
+    );
+}
+
+
+// =============================================================
+// UI IMPLEMENTATION
+// =============================================================
 
 fn apply_modern_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
@@ -322,13 +476,32 @@ impl eframe::App for AppState {
         self.poll_events();
         apply_modern_theme(ctx);
 
+        // Periodic Psiphon health check
+        if self.last_psiphon_check.elapsed().as_secs() > self.config.psiphon_health_check_interval_secs {
+            self.check_psiphon_health();
+        }
+
         egui::TopBottomPanel::top("header")
-            .exact_height(75.0)
+            .exact_height(85.0)
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(18, 20, 30)).inner_margin(15.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⚡ Config Collector Pro (Chained Tester)").size(26.0).strong().color(egui::Color32::from_rgb(230, 240, 255)));
+                    ui.label(egui::RichText::new("⚡ Config Collector Pro").size(24.0).strong().color(egui::Color32::from_rgb(230, 240, 255)));
+                    ui.label(egui::RichText::new("(Low-Bandwidth Optimized)").size(14.0).color(egui::Color32::GRAY));
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Psiphon Health Indicator
+                        let (ps_color, ps_text) = match self.psiphon_health_ok {
+                            Some(true) => (egui::Color32::from_rgb(30, 180, 120), "🟢 Psiphon OK"),
+                            Some(false) => (egui::Color32::from_rgb(220, 60, 60), "🔴 Psiphon Down"),
+                            None => (egui::Color32::from_rgb(200, 150, 40), "🟡 Psiphon Unknown"),
+                        };
+                        ui.group(|ui| {
+                            ui.label(egui::RichText::new(ps_text).color(ps_color).strong());
+                        });
+
+                        ui.add_space(20.0);
+
                         if self.running {
                             if ui.add(egui::Button::new(egui::RichText::new("🛑 Stop Process").strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(200, 40, 40))).clicked() {
                                 self.stop();
@@ -341,19 +514,32 @@ impl eframe::App for AppState {
                             if ui.button("🔄 Test Network").clicked() {
                                 self.test_connection();
                             }
+                            if ui.button("🏥 Check Psiphon").clicked() {
+                                self.check_psiphon_health();
+                            }
                         }
                     });
                 });
+
+                // Progress bar if testing
+                if let Some((current, total)) = self.testing_progress {
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Testing: {}/{}", current, total));
+                        ui.add(egui::ProgressBar::new(current as f32 / total.max(1) as f32).desired_width(300.0));
+                    });
+                }
             });
 
         egui::SidePanel::left("sidebar")
-            .default_width(340.0)
+            .default_width(360.0)
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(18, 20, 30)).inner_margin(15.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.active_tab, 0, "Main");
                     ui.selectable_value(&mut self.active_tab, 1, "Targets");
                     ui.selectable_value(&mut self.active_tab, 2, "Filters");
+                    ui.selectable_value(&mut self.active_tab, 3, "Hot Pool");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -368,44 +554,46 @@ impl eframe::App for AppState {
                             });
                             ui.add_space(10.0);
 
-                            ui.heading(egui::RichText::new("🌐 Network & Proxy").color(egui::Color32::LIGHT_BLUE));
-                            egui::ComboBox::from_label("Proxy").selected_text(match self.config.proxy_type {
-                                ProxyType::None => "Direct", ProxyType::System => "System Auto", ProxyType::Http => "HTTP", ProxyType::Socks5 => "SOCKS5",
-                            }).show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.config.proxy_type, ProxyType::Http, "HTTP");
-                                ui.selectable_value(&mut self.config.proxy_type, ProxyType::Socks5, "SOCKS5");
-                                ui.selectable_value(&mut self.config.proxy_type, ProxyType::None, "Direct");
-                            });
-                            if matches!(self.config.proxy_type, ProxyType::Http | ProxyType::Socks5) {
-                                ui.horizontal(|ui| { ui.label("IP:"); ui.text_edit_singleline(&mut self.config.proxy_host); });
-                                ui.horizontal(|ui| { ui.label("Port:"); ui.add(egui::DragValue::new(&mut self.config.proxy_port).clamp_range(1..=65535)); });
-                            }
-                            ui.checkbox(&mut self.config.ignore_ssl_errors, "Bypass SSL/TLS Filter");
+                            ui.heading(egui::RichText::new("🔗 Psiphon Upstream").color(egui::Color32::LIGHT_BLUE));
+                            ui.horizontal(|ui| { ui.label("HTTP Host:"); ui.text_edit_singleline(&mut self.config.psiphon_http_host); });
+                            ui.horizontal(|ui| { ui.label("HTTP Port:"); ui.add(egui::DragValue::new(&mut self.config.psiphon_http_port).clamp_range(1..=65535)); });
                             ui.add_space(15.0);
 
                             ui.heading(egui::RichText::new("⏱️ Scheduler").color(egui::Color32::LIGHT_BLUE));
-                            ui.horizontal(|ui| { ui.label("Interval (Min):"); ui.add(egui::DragValue::new(&mut self.config.interval_minutes).clamp_range(1..=240)); });
+                            ui.horizontal(|ui| { ui.label("Interval (Min):"); ui.add(egui::DragValue::new(&mut self.config.interval_minutes).clamp_range(5..=240)); });
                             ui.horizontal(|ui| { ui.label("Max Pages:"); ui.add(egui::DragValue::new(&mut self.config.max_pages_per_channel).clamp_range(1..=100)); });
                             ui.horizontal(|ui| { ui.label("Lookback Days:"); ui.add(egui::DragValue::new(&mut self.config.lookback_days).clamp_range(1..=30)); });
                             ui.add_space(15.0);
 
-                            ui.heading(egui::RichText::new("💾 Output & Testing").color(egui::Color32::LIGHT_BLUE));
-                            ui.checkbox(&mut self.config.output_new_only_enabled, "Extract New Configs Only");
-                            ui.checkbox(&mut self.config.output_append_unique_enabled, "Backup All Unique Configs");
-                            ui.checkbox(&mut self.config.test_configs_enabled, "✅ Enable Chained Xray Tester (Psiphon upstream)");
+                            ui.heading(egui::RichText::new("🧪 Testing Config").color(egui::Color32::LIGHT_BLUE));
+                            ui.checkbox(&mut self.config.test_configs_enabled, "Enable Two-Tier Testing");
+                            ui.horizontal(|ui| {
+                                ui.label("Tier 1 Timeout (s):");
+                                ui.add(egui::DragValue::new(&mut self.config.tier1_timeout_seconds).clamp_range(5..=60));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Tier 2 Timeout (s):");
+                                ui.add(egui::DragValue::new(&mut self.config.tier2_timeout_seconds).clamp_range(30..=300));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Concurrent Tests:");
+                                ui.add(egui::DragValue::new(&mut self.config.max_concurrent_tests).clamp_range(1..=4));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Min Success Bytes:");
+                                ui.add(egui::DragValue::new(&mut self.config.min_bytes_for_success).clamp_range(10..=1000));
+                            });
+                            ui.add_space(15.0);
 
-                            ui.horizontal(|ui| {
-                                ui.label("Test Timeout (Sec):");
-                                ui.add(egui::DragValue::new(&mut self.config.testing_timeout_seconds).clamp_range(60..=300));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Max Concurrent Tests:");
-                                ui.add(egui::DragValue::new(&mut self.config.max_concurrent_tests).clamp_range(1..=8));
-                            });
+                            ui.heading(egui::RichText::new("💾 Output").color(egui::Color32::LIGHT_BLUE));
+                            ui.checkbox(&mut self.config.output_new_only_enabled, "Extract New Configs Only");
+                            ui.checkbox(&mut self.config.output_append_unique_enabled, "Backup All Unique");
                         }
                         1 => {
                             ui.heading(egui::RichText::new("📡 Target Channels").color(egui::Color32::LIGHT_BLUE));
-                            ui.add_sized([ui.available_width(), ui.available_height() - 20.0], egui::TextEdit::multiline(&mut self.channels_text).font(egui::TextStyle::Monospace));
+                            ui.label("One channel per line (@channel or URL)");
+                            ui.add_sized([ui.available_width(), ui.available_height() - 40.0], 
+                                egui::TextEdit::multiline(&mut self.channels_text).font(egui::TextStyle::Monospace));
                         }
                         2 => {
                             ui.heading(egui::RichText::new("🎯 Protocols Filter").color(egui::Color32::LIGHT_BLUE));
@@ -413,9 +601,19 @@ impl eframe::App for AppState {
                                 ui.horizontal(|ui| {
                                     ui.checkbox(&mut rule.enabled, name);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.add(egui::DragValue::new(&mut rule.max_count).clamp_range(1..=50000));
+                                        ui.add(egui::DragValue::new(&mut rule.max_count).clamp_range(1..=1000));
                                     });
                                 });
+                            }
+                        }
+                        3 => {
+                            ui.heading(egui::RichText::new("🔥 Hot Pool Status").color(egui::Color32::LIGHT_BLUE));
+                            ui.label(format!("Cached working configs: {}", self.hot_pool_size));
+                            ui.label("These are recycled without retesting to save bandwidth.");
+                            ui.add_space(10.0);
+                            if ui.button("🗑️ Clear Hot Pool").clicked() {
+                                let _ = fs::remove_file(HOT_POOL_PATH);
+                                self.hot_pool_size = 0;
                             }
                         }
                         _ => {}
@@ -427,25 +625,50 @@ impl eframe::App for AppState {
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(13, 15, 23)).inner_margin(15.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.group(|ui| { ui.label(egui::RichText::new("Extracted Total:").color(egui::Color32::GRAY)); ui.label(egui::RichText::new(self.total_configs.to_string()).size(20.0).strong().color(egui::Color32::from_rgb(30, 180, 120))); });
-                    ui.group(|ui| { ui.label(egui::RichText::new("Tested & Working:").color(egui::Color32::GRAY)); ui.label(egui::RichText::new(self.working_configs.to_string()).size(20.0).strong().color(egui::Color32::from_rgb(255, 215, 0))); });
+                    ui.group(|ui| { 
+                        ui.label(egui::RichText::new("Extracted:").color(egui::Color32::GRAY)); 
+                        ui.label(egui::RichText::new(self.total_configs.to_string()).size(20.0).strong().color(egui::Color32::from_rgb(30, 180, 120))); 
+                    });
+                    ui.group(|ui| { 
+                        ui.label(egui::RichText::new("Working:").color(egui::Color32::GRAY)); 
+                        ui.label(egui::RichText::new(self.working_configs.to_string()).size(20.0).strong().color(egui::Color32::from_rgb(255, 215, 0))); 
+                    });
+                    ui.group(|ui| { 
+                        ui.label(egui::RichText::new("Hot Pool:").color(egui::Color32::GRAY)); 
+                        ui.label(egui::RichText::new(self.hot_pool_size.to_string()).size(20.0).strong().color(egui::Color32::from_rgb(100, 200, 255))); 
+                    });
                     let proxy_color = match self.proxy_access_ok {
                         Some(true) => egui::Color32::from_rgb(30, 180, 120),
                         Some(false) => egui::Color32::from_rgb(220, 60, 60),
                         None => egui::Color32::from_rgb(200, 150, 40),
                     };
-                    ui.group(|ui| { ui.label(egui::RichText::new("Connection:").color(egui::Color32::GRAY)); ui.label(egui::RichText::new(&self.proxy_access_status).size(14.0).strong().color(proxy_color)); });
+                    ui.group(|ui| { 
+                        ui.label(egui::RichText::new("Network:").color(egui::Color32::GRAY)); 
+                        ui.label(egui::RichText::new(&self.proxy_access_status).size(14.0).strong().color(proxy_color)); 
+                    });
                 });
+
+                // Protocol breakdown
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("By Protocol: ");
+                    for (proto, count) in &self.by_protocol {
+                        ui.label(egui::RichText::new(format!("{}: {}", proto, count)).color(egui::Color32::LIGHT_GRAY).monospace());
+                    }
+                });
+
                 ui.add_space(10.0);
                 egui::Frame::none().fill(egui::Color32::from_rgb(8, 10, 15)).rounding(8.0).inner_margin(10.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading(egui::RichText::new("Terminal Log").color(egui::Color32::WHITE));
                         if ui.button("Clear").clicked() { self.logs.clear(); }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new("Max 500 lines").color(egui::Color32::DARK_GRAY).small());
+                        });
                     });
                     ui.separator();
                     egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false; 2]).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
-                        for log in self.logs.iter().rev().take(400).rev() {
+                        for log in self.logs.iter().rev().take(500).rev() {
                             let color = match log.level {
                                 LogLevel::Debug => egui::Color32::from_rgb(100, 110, 130),
                                 LogLevel::Info => egui::Color32::from_rgb(160, 180, 200),
@@ -465,9 +688,11 @@ impl eframe::App for AppState {
     }
 }
 
+
 // =============================================================
 // NETWORK CORE
 // =============================================================
+
 fn fetch_html(url: &str, config: &AppConfig) -> Result<String> {
     match config.engine {
         ScrapingEngine::RealBrowser => fetch_with_safe_browser(url, config),
@@ -480,18 +705,14 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
     let mut args = vec![
         "--headless=new".to_string(), "--dump-dom".to_string(), "--disable-gpu".to_string(),
         "--no-sandbox".to_string(), "--disable-dev-shm-usage".to_string(), "--mute-audio".to_string(),
-        "--ignore-certificate-errors".to_string(), "--ignore-ssl-errors".to_string(), "--blink-settings=imagesEnabled=false".to_string(),
-        format!("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+        "--ignore-certificate-errors".to_string(), "--ignore-ssl-errors".to_string(), 
+        "--blink-settings=imagesEnabled=false".to_string(),
+        "--disable-javascript".to_string(), // Speed up for low bandwidth
+        format!("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0"),
     ];
-    match config.proxy_type {
-        ProxyType::System => {}
-        ProxyType::None => { args.push("--no-proxy-server".to_string()); }
-        ProxyType::Http | ProxyType::Socks5 => {
-            let scheme = if config.proxy_type == ProxyType::Socks5 { "socks5" } else { "http" };
-            let host = if config.proxy_host.is_empty() { "127.0.0.1" } else { &config.proxy_host };
-            args.push(format!("--proxy-server={}://{}:{}", scheme, host, config.proxy_port));
-        }
-    }
+
+    // Use Psiphon as proxy for browser too
+    args.push(format!("--proxy-server=http://{}:{}", config.psiphon_http_host, config.psiphon_http_port));
     args.push(url.to_string());
 
     let browsers = ["msedge.exe", "chrome.exe", r#"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"#, r#"C:\Program Files\Google\Chrome\Application\chrome.exe"#];
@@ -504,7 +725,7 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
         let mut stdout_str = String::new();
         let mut is_completed = false;
         if let Some(mut stdout) = child_proc.stdout.take() {
-            let mut buffer = [0; 4096];
+            let mut buffer = [0; 2048]; // Smaller buffer for low bandwidth
             loop {
                 if start_time.elapsed().as_millis() as u64 > timeout_ms { break; }
                 match stdout.read(&mut buffer) {
@@ -512,7 +733,7 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
                     Ok(n) => { stdout_str.push_str(&String::from_utf8_lossy(&buffer[..n])); }
                     Err(_) => break,
                 }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(100));
             }
         }
         if !is_completed { let _ = child_proc.kill(); return Err(anyhow::anyhow!("Browser timeout.")); }
@@ -523,190 +744,427 @@ fn fetch_with_safe_browser(url: &str, config: &AppConfig) -> Result<String> {
 }
 
 fn fetch_with_reqwest(url: &str, config: &AppConfig) -> Result<String> {
-    let mut b = ClientBuilder::new()
-        .timeout(Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
-        .danger_accept_invalid_certs(config.ignore_ssl_errors);
-    match config.proxy_type {
-        ProxyType::None => { b = b.no_proxy(); }
-        ProxyType::System => {}
-        ProxyType::Http | ProxyType::Socks5 => {
-            let scheme = if config.proxy_type == ProxyType::Socks5 && config.remote_dns { "socks5h" } else if config.proxy_type == ProxyType::Socks5 { "socks5" } else { "http" };
-            let host = if config.proxy_host.trim().is_empty() { "127.0.0.1" } else { config.proxy_host.trim() };
-            b = b.proxy(reqwest::Proxy::all(&format!("{}://{}:{}", scheme, host, config.proxy_port))?);
-        }
-    }
-    let resp = b.build()?.get(url).send()?;
+    // Build proxy URL for Psiphon
+    let proxy_url = format!("http://{}:{}", config.psiphon_http_host, config.psiphon_http_port);
+
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(25))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .danger_accept_invalid_certs(true)
+        .proxy(reqwest::Proxy::all(&proxy_url)?)
+        .build()?;
+
+    let resp = client.get(url).send()?;
     if !resp.status().is_success() { anyhow::bail!("HTTP {}", resp.status()); }
     Ok(resp.text()?)
 }
 
 // =============================================================
-// CHAINED XRAY CONFIG GENERATOR
+// PSIPHON HEALTH CHECK
 // =============================================================
-fn generate_chained_xray_config(link: &str, test_port: u16, psiphon_host: &str, psiphon_port: u16) -> Option<String> {
-    let proto = link.split("://").next()?.to_lowercase();
-    let upstream = json!({
-        "tag": "psiphon_upstream",
-        "protocol": "http",
-        "settings": { "servers": [{ "address": psiphon_host, "port": psiphon_port }] }
-    });
 
-    let mut main_outbound = match proto.as_str() {
-        "vless" | "trojan" => build_vless_trojan_outbound(link)?,
-        "vmess" => build_vmess_outbound(link)?,
-        "ss" => build_shadowsocks_outbound(link)?,
-        _ => return None,
-    };
+fn test_psiphon_alone(config: &AppConfig) -> Result<String> {
+    let proxy_url = format!("http://{}:{}", config.psiphon_http_host, config.psiphon_http_port);
 
-    main_outbound["proxySettings"] = json!({ "tag": "psiphon_upstream" });
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .proxy(reqwest::Proxy::all(&proxy_url)?)
+        .danger_accept_invalid_certs(true)
+        .build()?;
 
-    let xray_config = json!({
-        "log": { "loglevel": "error" },
-        "inbounds": [{ "port": test_port, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": true } }],
-        "outbounds": [main_outbound, upstream]
-    });
+    // Try to reach Telegram DC through Psiphon only
+    let start = Instant::now();
+    let resp = client.get(PSIPHON_TEST_URL).send()?;
+    let elapsed = start.elapsed().as_millis();
 
-    Some(serde_json::to_string_pretty(&xray_config).unwrap())
-}
-
-fn build_vless_trojan_outbound(link: &str) -> Option<serde_json::Value> {
-    let parsed = Url::parse(link).ok()?;
-    let host = parsed.host_str()?.to_string();
-    let port: u16 = parsed.port()?;
-    let queries: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-
-    let network = queries.get("type").map(|s| s.as_str()).unwrap_or("tcp");
-    let security = queries.get("security").map(|s| s.as_str()).unwrap_or("none");
-    let sni = queries.get("sni").unwrap_or(&host).to_string();
-    let path = queries.get("path").map(|s| s.as_str()).unwrap_or("/");
-    let flow = queries.get("flow").map(|s| s.as_str()).unwrap_or("");
-
-    let is_vless = link.starts_with("vless://");
-    let settings = if is_vless {
-        json!({ "vnext": [{ "address": host, "port": port, "users": [{ "id": parsed.username(), "encryption": "none", "flow": flow }] }] })
+    if resp.status().is_success() || resp.status().as_u16() == 400 { // 400 is OK for Telegram DC
+        Ok(format!("Connected ({}ms)", elapsed))
     } else {
-        json!({ "servers": [{ "address": host, "port": port, "password": parsed.username() }] })
-    };
-
-    let mut outbound = json!({
-        "protocol": if is_vless { "vless" } else { "trojan" },
-        "settings": settings,
-        "streamSettings": {
-            "network": network,
-            "security": security,
-            "tlsSettings": if security == "tls" { json!({ "serverName": sni }) } else { json!(null) },
-            "realitySettings": if security == "reality" {
-                json!({ "serverName": sni, "publicKey": queries.get("pbk").unwrap_or(&"".to_string()), "shortId": queries.get("sid").unwrap_or(&"".to_string()) })
-            } else { json!(null) },
-            "wsSettings": if network == "ws" { json!({ "path": path, "headers": { "Host": sni } }) } else { json!(null) },
-            "grpcSettings": if network == "grpc" { json!({ "serviceName": path }) } else { json!(null) }
-        }
-    });
-    outbound["tag"] = json!("proxy");
-    Some(outbound)
+        Err(anyhow::anyhow!("HTTP {}", resp.status()))
+    }
 }
 
-fn build_vmess_outbound(link: &str) -> Option<serde_json::Value> {
+// =============================================================
+// CONFIG PARSING AND ENDPOINT EXTRACTION
+// =============================================================
+
+fn extract_endpoint(link: &str) -> Option<String> {
+    // Extract IP:Port fingerprint for deduplication
+    if let Ok(url) = Url::parse(link) {
+        if let Some(host) = url.host_str() {
+            let port = url.port().unwrap_or(match url.scheme() {
+                "vless" | "vmess" | "trojan" => 443,
+                "ss" => 8388,
+                _ => 443,
+            });
+            return Some(format!("{}:{}", host, port));
+        }
+    }
+
+    // For vmess base64
+    if link.starts_with("vmess://") {
+        if let Some(b64) = link.strip_prefix("vmess://").and_then(|s| s.split('#').next()) {
+            if let Ok(decoded) = STANDARD.decode(b64) {
+                if let Ok(json_str) = String::from_utf8(decoded) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        let host = v["add"].as_str()?;
+                        let port = v["port"].as_str().unwrap_or("443");
+                        return Some(format!("{}:{}", host, port));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_config_link(link: &str) -> Option<ParsedConfig> {
+    let proto = link.split("://").next()?.to_lowercase();
+
+    match proto.as_str() {
+        "vless" | "trojan" => parse_vless_trojan(link),
+        "vmess" => parse_vmess(link),
+        "ss" => parse_shadowsocks(link),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedConfig {
+    protocol: String,
+    host: String,
+    port: u16,
+    uuid_or_pass: String,
+    params: HashMap<String, String>,
+    raw_link: String,
+}
+
+fn parse_vless_trojan(link: &str) -> Option<ParsedConfig> {
+    let url = Url::parse(link).ok()?;
+    let host = url.host_str()?.to_string();
+    let port = url.port()?;
+    let uuid_or_pass = url.username().to_string();
+
+    let mut params = HashMap::new();
+    for (k, v) in url.query_pairs() {
+        params.insert(k.to_string(), v.to_string());
+    }
+
+    Some(ParsedConfig {
+        protocol: link.split("://").next()?.to_string(),
+        host,
+        port,
+        uuid_or_pass,
+        params,
+        raw_link: link.to_string(),
+    })
+}
+
+fn parse_vmess(link: &str) -> Option<ParsedConfig> {
     let b64 = link.strip_prefix("vmess://")?.split('#').next()?.trim();
     let decoded = STANDARD.decode(b64).ok()?;
     let json_str = String::from_utf8(decoded).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&json_str).ok()?;
 
-    let host = v["add"].as_str()?.to_string();
-    let port: u16 = v["port"].as_str()?.parse().ok()?;
-    let id = v["id"].as_str()?.to_string();
-    let aid: u16 = v["aid"].as_str().unwrap_or("0").parse().unwrap_or(0);
-    let network = v["net"].as_str().unwrap_or("tcp");
-    let path = v["path"].as_str().unwrap_or("/");
-    let sni = v["host"].as_str().unwrap_or(&host).to_string();
-    let security = v["tls"].as_str().unwrap_or("none");
-
-    let outbound = json!({
-        "tag": "proxy",
-        "protocol": "vmess",
-        "settings": { "vnext": [{ "address": host, "port": port, "users": [{ "id": id, "alterId": aid, "security": "auto" }] }] },
-        "streamSettings": {
-            "network": network,
-            "security": security,
-            "tlsSettings": if security == "tls" { json!({ "serverName": sni }) } else { json!(null) },
-            "wsSettings": if network == "ws" { json!({ "path": path, "headers": { "Host": sni } }) } else { json!(null) }
-        }
-    });
-    Some(outbound)
+    Some(ParsedConfig {
+        protocol: "vmess".to_string(),
+        host: v["add"].as_str()?.to_string(),
+        port: v["port"].as_str()?.parse().ok()?,
+        uuid_or_pass: v["id"].as_str()?.to_string(),
+        params: HashMap::new(),
+        raw_link: link.to_string(),
+    })
 }
 
-fn build_shadowsocks_outbound(link: &str) -> Option<serde_json::Value> {
-    let mut clean = link.to_string();
-    if let Some(pos) = clean.find('#') { clean.truncate(pos); }
-    if let Some(pos) = clean.find('?') { clean.truncate(pos); }
+fn parse_shadowsocks(link: &str) -> Option<ParsedConfig> {
+    // Try base64@host:port format first
+    let after_ss = link.strip_prefix("ss://")?;
 
-    let after_ss = clean.strip_prefix("ss://").unwrap_or(&clean);
-
-    // Case 1: Your exact format → base64@ip:port (most common in Telegram now)
     if let Some((b64_part, host_port)) = after_ss.split_once('@') {
         if let Ok(decoded) = STANDARD.decode(b64_part) {
             let decoded_str = String::from_utf8_lossy(&decoded);
             if let Some((method, password)) = decoded_str.split_once(':') {
                 if let Some((host, port_str)) = host_port.split_once(':') {
                     if let Ok(port) = port_str.parse::<u16>() {
-                        return Some(json!({
-                            "tag": "proxy",
-                            "protocol": "shadowsocks",
-                            "settings": { "servers": [{ "address": host, "port": port, "method": method, "password": password }] }
-                        }));
+                        let mut params = HashMap::new();
+                        params.insert("method".to_string(), method.to_string());
+                        return Some(ParsedConfig {
+                            protocol: "ss".to_string(),
+                            host: host.to_string(),
+                            port,
+                            uuid_or_pass: password.to_string(),
+                            params,
+                            raw_link: link.to_string(),
+                        });
                     }
                 }
             }
         }
     }
 
-    // Case 2: Full base64 format (ss://base64#remark)
-    if let Ok(decoded) = STANDARD.decode(after_ss) {
-        let s = String::from_utf8_lossy(&decoded);
-        if let Some((userpass, hostport)) = s.split_once('@') {
-            if let Some((method, password)) = userpass.split_once(':') {
-                if let Some((host, port_str)) = hostport.split_once(':') {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        return Some(json!({
-                            "tag": "proxy",
-                            "protocol": "shadowsocks",
-                            "settings": { "servers": [{ "address": host, "port": port, "method": method, "password": password }] }
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    // Case 3: Plain format (fallback)
-    let u = Url::parse(&format!("ss://{}", after_ss)).ok()?;
-    let userinfo = u.username();
+    // Fallback to URL parsing
+    let url = Url::parse(link).ok()?;
+    let host = url.host_str()?.to_string();
+    let port = url.port()?;
+    let userinfo = url.username();
     let (method, password) = userinfo.split_once(':')?;
-    let host = u.host_str()?.to_string();
-    let port = u.port()?;
+
+    let mut params = HashMap::new();
+    params.insert("method".to_string(), method.to_string());
+
+    Some(ParsedConfig {
+        protocol: "ss".to_string(),
+        host,
+        port,
+        uuid_or_pass: password.to_string(),
+        params,
+        raw_link: link.to_string(),
+    })
+}
+
+
+// =============================================================
+// XRAY CONFIG GENERATION
+// =============================================================
+
+fn generate_xray_config(parsed: &ParsedConfig, socks_port: u16, psiphon_host: &str, psiphon_port: u16) -> Option<String> {
+    let outbound = match parsed.protocol.as_str() {
+        "vless" => build_vless_outbound(parsed),
+        "trojan" => build_trojan_outbound(parsed),
+        "vmess" => build_vmess_outbound(parsed),
+        "ss" => build_ss_outbound(parsed),
+        _ => return None,
+    }?;
+
+    // Psiphon as upstream proxy
+    let psiphon_upstream = json!({
+        "tag": "psiphon-out",
+        "protocol": "http",
+        "settings": {
+            "servers": [{
+                "address": psiphon_host,
+                "port": psiphon_port
+            }]
+        }
+    });
+
+    let config = json!({
+        "log": {
+            "loglevel": "error",
+            "access": "",
+            "error": ""
+        },
+        "inbounds": [{
+            "port": socks_port,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": {
+                "udp": true,
+                "auth": "noauth"
+            },
+            "sniffing": {
+                "enabled": false
+            }
+        }],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": parsed.protocol.clone(),
+                "settings": outbound,
+                "proxySettings": {
+                    "tag": "psiphon-out"
+                },
+                "streamSettings": build_stream_settings(parsed)
+            },
+            psiphon_upstream,
+            {
+                "tag": "direct",
+                "protocol": "freedom"
+            },
+            {
+                "tag": "block",
+                "protocol": "blackhole"
+            }
+        ],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": []
+        }
+    });
+
+    Some(serde_json::to_string_pretty(&config).unwrap())
+}
+
+fn build_vless_outbound(parsed: &ParsedConfig) -> Option<serde_json::Value> {
+    let flow = parsed.params.get("flow").map(|s| s.as_str()).unwrap_or("");
+    let encryption = parsed.params.get("encryption").map(|s| s.as_str()).unwrap_or("none");
 
     Some(json!({
-        "tag": "proxy",
-        "protocol": "shadowsocks",
-        "settings": { "servers": [{ "address": host, "port": port, "method": method, "password": password }] }
+        "vnext": [{
+            "address": parsed.host,
+            "port": parsed.port,
+            "users": [{
+                "id": parsed.uuid_or_pass,
+                "encryption": encryption,
+                "flow": flow
+            }]
+        }]
     }))
 }
+
+fn build_trojan_outbound(parsed: &ParsedConfig) -> Option<serde_json::Value> {
+    Some(json!({
+        "servers": [{
+            "address": parsed.host,
+            "port": parsed.port,
+            "password": parsed.uuid_or_pass
+        }]
+    }))
+}
+
+fn build_vmess_outbound(parsed: &ParsedConfig) -> Option<serde_json::Value> {
+    let aid: u16 = parsed.params.get("aid").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    Some(json!({
+        "vnext": [{
+            "address": parsed.host,
+            "port": parsed.port,
+            "users": [{
+                "id": parsed.uuid_or_pass,
+                "alterId": aid,
+                "security": "auto"
+            }]
+        }]
+    }))
+}
+
+fn build_ss_outbound(parsed: &ParsedConfig) -> Option<serde_json::Value> {
+    let method = parsed.params.get("method").map(|s| s.as_str()).unwrap_or("aes-256-gcm");
+
+    Some(json!({
+        "servers": [{
+            "address": parsed.host,
+            "port": parsed.port,
+            "method": method,
+            "password": parsed.uuid_or_pass
+        }]
+    }))
+}
+
+fn build_stream_settings(parsed: &ParsedConfig) -> serde_json::Value {
+    let network = parsed.params.get("type").map(|s| s.as_str()).unwrap_or("tcp");
+    let security = parsed.params.get("security").map(|s| s.as_str()).unwrap_or("none");
+    let sni = parsed.params.get("sni").map(|s| s.to_string()).unwrap_or_else(|| parsed.host.clone());
+    let path = parsed.params.get("path").map(|s| s.to_string()).unwrap_or_else(|| "/".to_string());
+    let host = parsed.params.get("host").map(|s| s.to_string()).unwrap_or_else(|| parsed.host.clone());
+
+    let mut settings = json!({
+        "network": network,
+        "security": security
+    });
+
+    // TLS settings
+    if security == "tls" {
+        settings["tlsSettings"] = json!({
+            "serverName": sni,
+            "allowInsecure": true,
+            "alpn": ["h2", "http/1.1"]
+        });
+    }
+
+    // Reality settings
+    if security == "reality" {
+        let pbk = parsed.params.get("pbk").map(|s| s.to_string()).unwrap_or_default();
+        let sid = parsed.params.get("sid").map(|s| s.to_string()).unwrap_or_default();
+        settings["realitySettings"] = json!({
+            "serverName": sni,
+            "publicKey": pbk,
+            "shortId": sid,
+            "fingerprint": "chrome",
+            "spiderX": ""
+        });
+    }
+
+    // WebSocket settings
+    if network == "ws" {
+        settings["wsSettings"] = json!({
+            "path": path,
+            "headers": {
+                "Host": host
+            }
+        });
+    }
+
+    // gRPC settings
+    if network == "grpc" {
+        settings["grpcSettings"] = json!({
+            "serviceName": path.trim_start_matches('/'),
+            "multiMode": false
+        });
+    }
+
+    settings
+}
+
 // =============================================================
-// CHAINED TESTER
+// TWO-TIER TESTING SYSTEM
 // =============================================================
-fn test_config_chained(link: &str, test_port: u16, psiphon_host: &str, psiphon_port: u16, timeout_secs: u64, tx: &Sender<AppEvent>) -> bool {
-    let json_config = match generate_chained_xray_config(link, test_port, psiphon_host, psiphon_port) {
+
+fn tier1_quick_test(parsed: &ParsedConfig, timeout_secs: u64) -> bool {
+    // Tier 1: Just check if destination port is reachable
+    // This filters out 70% of dead configs without full Xray startup
+    let addr = format!("{}:{}", parsed.host, parsed.port);
+
+    match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(timeout_secs)) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+fn tier2_full_test(
+    parsed: &ParsedConfig, 
+    socks_port: u16, 
+    config: &AppConfig,
+    tx: &Sender<AppEvent>
+) -> TestResult {
+    let start_time = Instant::now();
+    let endpoint = format!("{}:{}", parsed.host, parsed.port);
+
+    // Generate Xray config
+    let xray_json = match generate_xray_config(
+        parsed, 
+        socks_port, 
+        &config.psiphon_http_host, 
+        config.psiphon_http_port
+    ) {
         Some(c) => c,
         None => {
-            let _ = tx.send(AppEvent::Log(LogLevel::Warning, format!("⚠️ Unsupported protocol for {}", link)));
-            return false;
+            return TestResult {
+                link: parsed.raw_link.clone(),
+                endpoint: endpoint.clone(),
+                success: false,
+                connect_time_secs: 0.0,
+                bytes_transferred: 0,
+                error: Some("Failed to generate Xray config".to_string()),
+            };
         }
     };
 
-    let temp_file = format!("temp_test_{}.json", test_port);
-    let _ = fs::write(&temp_file, json_config);
+    // Write temp config
+    let temp_file = format!("temp_xray_{}.json", socks_port);
+    if let Err(e) = fs::write(&temp_file, xray_json) {
+        return TestResult {
+            link: parsed.raw_link.clone(),
+            endpoint: endpoint.clone(),
+            success: false,
+            connect_time_secs: 0.0,
+            bytes_transferred: 0,
+            error: Some(format!("Failed to write config: {}", e)),
+        };
+    }
 
+    // Start Xray
     let mut child = match Command::new("xray.exe")
         .args(&["run", "-c", &temp_file])
         .creation_flags(CREATE_NO_WINDOW)
@@ -715,263 +1173,288 @@ fn test_config_chained(link: &str, test_port: u16, psiphon_host: &str, psiphon_p
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => {
-            let _ = tx.send(AppEvent::Log(LogLevel::Error, "xray.exe not found!".to_string()));
+        Err(e) => {
             let _ = fs::remove_file(&temp_file);
-            return false;
+            return TestResult {
+                link: parsed.raw_link.clone(),
+                endpoint: endpoint.clone(),
+                success: false,
+                connect_time_secs: 0.0,
+                bytes_transferred: 0,
+                error: Some(format!("Failed to start xray: {}", e)),
+            };
         }
     };
 
-    thread::sleep(Duration::from_secs(8));
+    // Wait for Xray to initialize (longer for low bandwidth)
+    thread::sleep(Duration::from_secs(5));
 
-    let proxy_url = format!("socks5h://127.0.0.1:{}", test_port);
-    let client = ClientBuilder::new()
-        .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
-        .timeout(Duration::from_secs(timeout_secs))
+    // Test through SOCKS proxy
+    let proxy_url = format!("socks5h://127.0.0.1:{}", socks_port);
+    let client = match ClientBuilder::new()
+        .proxy(reqwest::Proxy::all(&proxy_url).unwrap_or_else(|_| reqwest::Proxy::custom(|_| None)))
+        .timeout(Duration::from_secs(config.tier2_timeout_seconds))
+        .danger_accept_invalid_certs(true)
         .build()
-        .unwrap();
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = fs::remove_file(&temp_file);
+            return TestResult {
+                link: parsed.raw_link.clone(),
+                endpoint: endpoint.clone(),
+                success: false,
+                connect_time_secs: 0.0,
+                bytes_transferred: 0,
+                error: Some(format!("Failed to build HTTP client: {}", e)),
+            };
+        }
+    };
 
-    let dc_ip = "149.154.167.91";
-    let result = client.get(format!("https://{}", dc_ip)).send();
-    let is_working = result.is_ok();
+    // Try to reach Telegram DC
+    let test_start = Instant::now();
+    let result = client.get(PSIPHON_TEST_URL).send();
+    let connect_time = test_start.elapsed().as_secs_f64();
 
+    let (success, bytes_transferred, error) = match result {
+        Ok(resp) => {
+            let bytes = resp.text().unwrap_or_default().len();
+            if bytes >= config.min_bytes_for_success {
+                (true, bytes, None)
+            } else {
+                (false, bytes, Some(format!("Only received {} bytes, min required {}", bytes, config.min_bytes_for_success)))
+            }
+        }
+        Err(e) => (false, 0, Some(e.to_string())),
+    };
+
+    // Cleanup
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(&temp_file);
 
-    let _ = tx.send(AppEvent::Log(
-        if is_working { LogLevel::Success } else { LogLevel::Warning },
-        format!("{} {}", if is_working { "🟢 SUCCESS" } else { "🔴 FAILED" }, link.split_at(link.find('#').unwrap_or(link.len())).0),
-    ));
-
-    is_working
+    TestResult {
+        link: parsed.raw_link.clone(),
+        endpoint,
+        success,
+        connect_time_secs: connect_time,
+        bytes_transferred,
+        error,
+    }
 }
 
+fn test_single_config(
+    link: &str,
+    socks_port: u16,
+    config: &AppConfig,
+    hot_pool: &HotPool,
+    history: &SentHistory,
+    tx: &Sender<AppEvent>,
+) -> Option<TestResult> {
+    // Skip if tested recently
+    if history.was_tested_recently(link, 30) {
+        let _ = tx.send(AppEvent::Log(LogLevel::Debug, format!("⏭️ Skipping recently tested: {}", link)));
+        return None;
+    }
+
+    // Parse config
+    let parsed = match parse_config_link(link) {
+        Some(p) => p,
+        None => {
+            let _ = tx.send(AppEvent::Log(LogLevel::Warning, format!("⚠️ Failed to parse: {}", link)));
+            return None;
+        }
+    };
+
+    let endpoint = format!("{}:{}", parsed.host, parsed.port);
+
+    // Check if endpoint already known working (deduplication)
+    if hot_pool.is_endpoint_tested_recently(&endpoint, 60) {
+        let _ = tx.send(AppEvent::Log(LogLevel::Info, format!("📌 Endpoint {} recently verified, marking as working", endpoint)));
+        return Some(TestResult {
+            link: link.to_string(),
+            endpoint,
+            success: true,
+            connect_time_secs: 0.0,
+            bytes_transferred: 0,
+            error: None,
+        });
+    }
+
+    // Tier 1: Quick TCP test
+    let _ = tx.send(AppEvent::Log(LogLevel::Debug, format!("🔍 Tier 1 testing: {}", link)));
+    if !tier1_quick_test(&parsed, config.tier1_timeout_seconds) {
+        let _ = tx.send(AppEvent::Log(LogLevel::Debug, format!("❌ Tier 1 failed: {}", link)));
+        return Some(TestResult {
+            link: link.to_string(),
+            endpoint,
+            success: false,
+            connect_time_secs: 0.0,
+            bytes_transferred: 0,
+            error: Some("Tier 1: TCP connection failed".to_string()),
+        });
+    }
+
+    // Tier 2: Full Xray test through Psiphon
+    let _ = tx.send(AppEvent::Log(LogLevel::Info, format!("🧪 Tier 2 testing: {}", link)));
+    let result = tier2_full_test(&parsed, socks_port, config, tx);
+
+    let status = if result.success { "✅ WORKING" } else { "❌ FAILED" };
+    let _ = tx.send(AppEvent::Log(
+        if result.success { LogLevel::Success } else { LogLevel::Warning },
+        format!("{} {} ({} bytes, {:.1}s)", status, link, result.bytes_transferred, result.connect_time_secs)
+    ));
+
+    Some(result)
+}
+
+
 // =============================================================
-// CONCURRENT TESTER
+// CONCURRENT TESTING WITH BANDWIDTH MANAGEMENT
 // =============================================================
-fn test_configs_concurrently(links: &[String], config: &AppConfig, tx: &Sender<AppEvent>, output_dir: &str) -> usize {
-    if links.is_empty() { return 0; }
 
-    let max_con = config.max_concurrent_tests.clamp(1, 8);
-    let ps_host = config.proxy_host.clone();
-    let ps_port = config.proxy_port;
-    let timeout = config.testing_timeout_seconds;
-    let base_port = 10090u16;
+fn test_configs_batch(
+    links: &[String],
+    config: &AppConfig,
+    hot_pool: &mut HotPool,
+    history: &mut SentHistory,
+    tx: &Sender<AppEvent>,
+) -> Vec<TestResult> {
+    if links.is_empty() { return vec![]; }
 
-    let mut working_links: Vec<String> = vec![];
+    let max_concurrent = config.max_concurrent_tests.clamp(1, 4); // Hard limit for low bandwidth
+    let base_port = 20000u16;
+    let mut results = vec![];
 
-    let chunks: Vec<_> = links.chunks(max_con).collect();
-    for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        if chunk.is_empty() { continue; }
+    let _ = tx.send(AppEvent::Log(LogLevel::Info, format!("🧪 Starting batch test: {} configs, max {} concurrent", links.len(), max_concurrent)));
 
+    // Process in chunks to control concurrency
+    for (chunk_idx, chunk) in links.chunks(max_concurrent).enumerate() {
+        let chunk_start = chunk_idx * max_concurrent;
+
+        // Update progress
+        let _ = tx.send(AppEvent::TestingProgress { 
+            current: chunk_start, 
+            total: links.len() 
+        });
+
+        // Spawn threads for this chunk
         let mut handles = vec![];
-        for (i, link_ref) in chunk.iter().enumerate() {
-            let link = link_ref.clone();
-            let link_for_thread = link.clone();
-            let tx_clone = tx.clone();
-            let ps_h = ps_host.clone();
-            let t_port = base_port + (chunk_idx * max_con + i) as u16;
+        for (i, link) in chunk.iter().enumerate() {
+            let link = link.clone();
+            let config = config.clone();
+            let hot_pool = hot_pool.clone();
+            let history = history.clone();
+            let tx = tx.clone();
+            let port = base_port + (chunk_start + i) as u16;
 
             let handle = thread::spawn(move || {
-                test_config_chained(&link_for_thread, t_port, &ps_h, ps_port, timeout, &tx_clone)
+                test_single_config(&link, port, &config, &hot_pool, &history, &tx)
             });
             handles.push((link, handle));
         }
 
+        // Collect results
         for (link, handle) in handles {
-            if let Ok(true) = handle.join() {
-                working_links.push(link);
+            match handle.join() {
+                Ok(Some(result)) => {
+                    history.mark_tested(&link);
+                    hot_pool.update_or_add(&link, &result.endpoint, result.success, result.connect_time_secs);
+                    results.push(result);
+                }
+                Ok(None) => {
+                    // Skipped
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Log(LogLevel::Error, format!("💥 Thread panic for {}: {:?}", link, e)));
+                }
             }
         }
 
+        // Cooldown between chunks to let Psiphon recover
         thread::sleep(Duration::from_secs(3));
-    }
 
-    fs::create_dir_all(output_dir).ok();
-    let mut saved_count = 0;
-    for link in &working_links {
-        if let Some(proto) = link.split("://").next() {
-            let path = Path::new(output_dir).join(format!("working_{}.txt", proto));
-            let mut set = read_existing_set(&path).unwrap_or_else(|_| BTreeSet::new());
-            set.insert(link.clone());
-            let lines: Vec<String> = set.into_iter().collect();
-            if fs::write(&path, lines.join("\n")).is_ok() {
-                saved_count += 1;
-            }
+        // Check stop flag
+        if Arc::new(AtomicBool::new(false)).load(Ordering::SeqCst) {
+            break;
         }
     }
 
-    let _ = tx.send(AppEvent::Log(LogLevel::Success, format!("🏆 Chained testing complete: {} working configs found!", saved_count)));
-    saved_count
+    let _ = tx.send(AppEvent::TestingProgress { current: links.len(), total: links.len() });
+    results
 }
 
 // =============================================================
-// WORKER
+// OUTPUT WRITING
 // =============================================================
-fn run_worker(config: AppConfig, channels_raw: String, stop: Arc<AtomicBool>, tx: Sender<AppEvent>) -> Result<()> {
-    let channels = parse_channels(&channels_raw);
-    let regex_pattern = r#"(?i)(vless|vmess|trojan|ss|ssr|tuic|hysteria|hysteria2|hy2|juicity|snell|anytls|ssh|wireguard|wg|warp|socks|socks4|socks5|tg|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt)://[^\s<>`"'\\]+"#;
-    let regex = Regex::new(regex_pattern).unwrap();
-    let date_regex = Regex::new(r#"<time datetime="([^"]+)""#).unwrap();
-    let mut history = SentHistory::load();
-    let threshold_date = Utc::now() - ChronoDuration::days(config.lookback_days.max(1));
 
-    log_worker(&tx, LogLevel::Info, format!("🚀 Crawler Started | Engine: {:?} | Psiphon upstream: {}:{}", config.engine, config.proxy_host, config.proxy_port));
+fn write_working_configs(results: &[TestResult], output_dir: &str) -> Result<usize> {
+    fs::create_dir_all(output_dir)?;
 
-    loop {
-        if stop.load(Ordering::SeqCst) { break; }
-        history.prune(config.lookback_days);
-        let mut gathered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut total_run_configs = 0;
+    let mut by_protocol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-        for channel in &channels {
-            if stop.load(Ordering::SeqCst) { break; }
-            log_worker(&tx, LogLevel::Info, format!("📡 Scanning channel: @{}", channel));
-            let mut before: Option<String> = None;
-            let mut channel_configs = 0;
-
-            for page in 1..=config.max_pages_per_channel {
-                if stop.load(Ordering::SeqCst) { break; }
-                let mut url = format!("https://t.me/s/{}", channel);
-                if let Some(ref id) = before { url.push_str(&format!("?before={}", id)); }
-
-                match fetch_html(&url, &config) {
-                    Ok(raw_html) => {
-                        let mut found_in_page = 0;
-                        let mut next_before = None;
-                        let decoded_html = raw_html.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"");
-                        let next_regex = Regex::new(r#"data-post="[^/]+/(\d+)""#).unwrap();
-                        for cap in next_regex.captures_iter(&decoded_html) { next_before = Some(cap[1].to_string()); }
-
-                        let blocks: Vec<&str> = decoded_html.split("tgme_widget_message ").collect();
-
-                        for block in blocks {
-                            let mut is_valid_date = true;
-                            if let Some(caps) = date_regex.captures(block) {
-                                if let Ok(parsed_date) = DateTime::parse_from_rfc3339(&caps[1]) {
-                                    if parsed_date.with_timezone(&Utc) < threshold_date { is_valid_date = false; }
-                                }
-                            }
-                            if is_valid_date {
-                                for m in regex.find_iter(block) {
-                                    let clean_link = m.as_str().trim_end_matches(&['(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'][..]).to_string();
-                                    if clean_link.starts_with("tg://resolve") || clean_link.starts_with("tg://join") || clean_link.starts_with("tg://set") || clean_link.starts_with("tg://bg") {
-                                        continue;
-                                    }
-                                    if let Some(proto) = clean_link.split("://").next() {
-                                        let proto_lower = proto.to_lowercase();
-                                        let should_keep = config.protocol_rules.get(&proto_lower).map_or(false, |r| r.enabled);
-                                        if should_keep {
-                                            found_in_page += 1;
-                                            gathered.entry(proto_lower).or_default().insert(clean_link);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if found_in_page > 0 { log_worker(&tx, LogLevel::Success, format!("    ✔️ Page {}: {} configs extracted.", page, found_in_page)); } 
-                        else if next_before.is_none() { break; }
-                        channel_configs += found_in_page;
-                        before = next_before;
-                    }
-                    Err(e) => { log_worker(&tx, LogLevel::Warning, format!("    ⚠️ Page {} failed: {}", page, e)); }
-                }
-                thread::sleep(Duration::from_secs(3));
-            }
-            total_run_configs += channel_configs;
-        }
-
-        apply_protocol_limits(&mut gathered, &config.protocol_rules);
-
-        let mut new_only: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut total_new = 0;
-        for (proto, links) in &gathered {
-            for link in links {
-                if !history.sent_at.contains_key(link) {
-                    history.sent_at.insert(link.clone(), Utc::now());
-                    new_only.entry(proto.clone()).or_default().insert(link.clone());
-                    total_new += 1;
-                }
-            }
-        }
-
-        if config.output_new_only_enabled && !new_only.is_empty() { let _ = write_outputs_replace(OUTPUT_NEW_DIR, &new_only); }
-        if config.output_append_unique_enabled && !gathered.is_empty() { let _ = write_outputs_append_unique(OUTPUT_APPEND_DIR, &gathered); }
-
-        let mut newly_working_count = 0;
-        if config.test_configs_enabled && !new_only.is_empty() {
-            log_worker(&tx, LogLevel::Info, "🔍 Starting concurrent chained testing (Psiphon upstream)...".to_string());
-
-            let to_test: Vec<String> = new_only
-                .iter()
-                .filter(|(p, _)| ["vless", "vmess", "trojan", "ss"].contains(&p.as_str()))
-                .flat_map(|(_, links)| links.iter().cloned())
-                .collect();
-
-            newly_working_count = test_configs_concurrently(&to_test, &config, &tx, OUTPUT_TESTED_DIR);
-        }
-
-        let mut by_protocol = BTreeMap::new();
-        for (k, v) in &new_only { by_protocol.insert(k.clone(), v.len()); }
-
-        let _ = history.save();
-        let _ = tx.send(AppEvent::Stats { total: total_new, working: newly_working_count, by_protocol });
-
-        log_worker(&tx, LogLevel::Success, format!("🎉 Cycle Complete! {} extracted, {} new.", total_run_configs, total_new));
-
-        for _ in 0..(config.interval_minutes * 60) {
-            if stop.load(Ordering::SeqCst) { break; }
-            thread::sleep(Duration::from_secs(1));
+    for result in results.iter().filter(|r| r.success) {
+        if let Some(proto) = result.link.split("://").next() {
+            by_protocol.entry(proto.to_string()).or_default().insert(result.link.clone());
         }
     }
-    Ok(())
-}
 
-fn log_worker(tx: &Sender<AppEvent>, level: LogLevel, text: String) {
-    let _ = tx.send(AppEvent::Log(level, text));
-}
+    let mut total_written = 0;
 
-fn apply_protocol_limits(store: &mut BTreeMap<String, BTreeSet<String>>, rules: &BTreeMap<String, ProtocolRule>) {
-    for (proto, links) in store.iter_mut() {
-        if let Some(rule) = rules.get(proto) {
-            if links.len() > rule.max_count { *links = links.iter().take(rule.max_count).cloned().collect(); }
-        }
+    // Write by protocol
+    for (proto, links) in &by_protocol {
+        let path = Path::new(output_dir).join(format!("working_{}.txt", proto));
+        let mut existing = read_existing_set(&path).unwrap_or_default();
+        existing.extend(links.iter().cloned());
+
+        let lines: Vec<String> = existing.into_iter().collect();
+        fs::write(&path, lines.join("\n"))?;
+        total_written += links.len();
     }
+
+    // Write mixed
+    let mixed_path = Path::new(output_dir).join("working_mixed.txt");
+    let mut mixed_existing = read_existing_set(&mixed_path).unwrap_or_default();
+    for result in results.iter().filter(|r| r.success) {
+        mixed_existing.insert(result.link.clone());
+    }
+    let mixed_lines: Vec<String> = mixed_existing.into_iter().collect();
+    fs::write(mixed_path, mixed_lines.join("\n"))?;
+
+    Ok(total_written)
 }
 
-fn write_outputs_replace(base_dir: &str, store: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
-    if store.is_empty() { return Ok(()); }
-    fs::create_dir_all(base_dir)?;
-    let mut mixed = Vec::new();
-    for (p, links) in store {
+fn write_new_only(output_dir: &str, configs: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+
+    let mut all_links = vec![];
+    for (proto, links) in configs {
         if links.is_empty() { continue; }
         let lines: Vec<String> = links.iter().cloned().collect();
-        fs::write(Path::new(base_dir).join(format!("{p}.txt")), lines.join("\n"))?;
-        mixed.extend(lines);
+        fs::write(Path::new(output_dir).join(format!("{}.txt", proto)), lines.join("\n"))?;
+        all_links.extend(lines);
     }
-    if !mixed.is_empty() { fs::write(Path::new(base_dir).join("mixed.txt"), mixed.join("\n"))?; }
+
+    if !all_links.is_empty() {
+        fs::write(Path::new(output_dir).join("mixed.txt"), all_links.join("\n"))?;
+    }
+
     Ok(())
 }
 
-fn write_outputs_append_unique(base_dir: &str, store: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
-    if store.is_empty() { return Ok(()); }
-    fs::create_dir_all(base_dir)?;
-    for (p, links) in store {
+fn write_append_unique(output_dir: &str, configs: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+
+    for (proto, links) in configs {
         if links.is_empty() { continue; }
-        let path = Path::new(base_dir).join(format!("{p}.txt"));
-        let mut combined = read_existing_set(&path)?;
-        combined.extend(links.iter().cloned());
-        let lines: Vec<String> = combined.into_iter().collect();
+        let path = Path::new(output_dir).join(format!("{}.txt", proto));
+        let mut existing = read_existing_set(&path).unwrap_or_default();
+        existing.extend(links.iter().cloned());
+        let lines: Vec<String> = existing.into_iter().collect();
         fs::write(&path, lines.join("\n"))?;
     }
-    let path_mixed = Path::new(base_dir).join("mixed.txt");
-    let mut mixed = read_existing_set(&path_mixed)?;
-    for links in store.values() { mixed.extend(links.iter().cloned()); }
-    if !mixed.is_empty() {
-        let mixed_lines: Vec<String> = mixed.into_iter().collect();
-        fs::write(path_mixed, mixed_lines.join("\n"))?;
-    }
+
     Ok(())
 }
 
@@ -981,10 +1464,244 @@ fn read_existing_set(path: &Path) -> Result<BTreeSet<String>> {
     Ok(raw.lines().map(str::trim).filter(|l| !l.is_empty()).map(ToOwned::to_owned).collect())
 }
 
+// =============================================================
+// WORKER THREAD
+// =============================================================
+
+fn run_worker(
+    config: AppConfig, 
+    channels_raw: String, 
+    stop: Arc<AtomicBool>, 
+    tx: Sender<AppEvent>
+) -> Result<()> {
+    let channels = parse_channels(&channels_raw);
+    let regex_pattern = r#"(?i)(vless|vmess|trojan|ss)://[^\s<>`"'\\]+"#;
+    let regex = Regex::new(regex_pattern).unwrap();
+    let date_regex = Regex::new(r#"<time datetime="([^"]+)""#).unwrap();
+
+    let mut history = SentHistory::load();
+    let mut hot_pool = HotPool::load();
+    let threshold_date = Utc::now() - ChronoDuration::days(config.lookback_days.max(1));
+
+    log_worker(&tx, LogLevel::Info, format!(
+        "🚀 Worker Started | Channels: {} | Psiphon: {}:{} | Hot Pool: {} configs",
+        channels.len(), config.psiphon_http_host, config.psiphon_http_port, hot_pool.entries.len()
+    ));
+
+    loop {
+        if stop.load(Ordering::SeqCst) { break; }
+
+        history.prune(config.lookback_days);
+
+        // Check Psiphon health first
+        match test_psiphon_alone(&config) {
+            Ok(_) => {
+                let _ = tx.send(AppEvent::PsiphonHealth { ok: true, detail: "Healthy".to_string() });
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::PsiphonHealth { ok: false, detail: e.to_string() });
+                log_worker(&tx, LogLevel::Error, format!("🚨 Psiphon not working! Waiting 60s..."));
+                for _ in 0..60 {
+                    if stop.load(Ordering::SeqCst) { break; }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                continue;
+            }
+        }
+
+        // SCRAPING PHASE
+        log_worker(&tx, LogLevel::Info, "📡 Starting scraping phase...".to_string());
+        let mut gathered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut total_scraped = 0;
+
+        for channel in &channels {
+            if stop.load(Ordering::SeqCst) { break; }
+            log_worker(&tx, LogLevel::Info, format!("📡 Scanning @{}...", channel));
+
+            let mut before: Option<String> = None;
+            let mut channel_new = 0;
+
+            for page in 1..=config.max_pages_per_channel {
+                if stop.load(Ordering::SeqCst) { break; }
+
+                let mut url = format!("https://t.me/s/{}", channel);
+                if let Some(ref id) = before { url.push_str(&format!("?before={}", id)); }
+
+                match fetch_html(&url, &config) {
+                    Ok(html) => {
+                        let decoded = html.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">");
+                        let mut found_in_page = 0;
+                        let mut next_before = None;
+
+                        // Find next page cursor
+                        let next_regex = Regex::new(r#"data-post="[^/]+/(\d+)""#).unwrap();
+                        for cap in next_regex.captures_iter(&decoded) {
+                            next_before = Some(cap[1].to_string());
+                        }
+
+                        // Split by message blocks
+                        let blocks: Vec<&str> = decoded.split("tgme_widget_message ").collect();
+
+                        for block in blocks {
+                            // Check date
+                            let mut is_recent = true;
+                            if let Some(caps) = date_regex.captures(block) {
+                                if let Ok(parsed_date) = DateTime::parse_from_rfc3339(&caps[1]) {
+                                    if parsed_date.with_timezone(&Utc) < threshold_date {
+                                        is_recent = false;
+                                    }
+                                }
+                            }
+
+                            if is_recent {
+                                for m in regex.find_iter(block) {
+                                    let clean = m.as_str().trim_end_matches(&['(', ')', '[', ']', ' ', '!', '.', ',', ';', '\'', '"', '<', '>'][..]);
+                                    if let Some(proto) = clean.split("://").next() {
+                                        let proto_lower = proto.to_lowercase();
+                                        if config.protocol_rules.get(&proto_lower).map_or(false, |r| r.enabled) {
+                                            if !history.sent_at.contains_key(clean) {
+                                                gathered.entry(proto_lower).or_default().insert(clean.to_string());
+                                                found_in_page += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if found_in_page > 0 {
+                            log_worker(&tx, LogLevel::Success, format!("  ✔️ Page {}: {} new configs", page, found_in_page));
+                            channel_new += found_in_page;
+                        } else if next_before.is_none() {
+                            break;
+                        }
+
+                        before = next_before;
+                    }
+                    Err(e) => {
+                        log_worker(&tx, LogLevel::Warning, format!("  ⚠️ Page {} failed: {}", page, e));
+                    }
+                }
+
+                thread::sleep(Duration::from_secs(2));
+            }
+
+            total_scraped += channel_new;
+        }
+
+        // Apply protocol limits
+        for (proto, links) in gathered.iter_mut() {
+            if let Some(rule) = config.protocol_rules.get(proto) {
+                if links.len() > rule.max_count {
+                    *links = links.iter().take(rule.max_count).cloned().collect();
+                }
+            }
+        }
+
+        log_worker(&tx, LogLevel::Info, format!("📊 Scraped {} unique configs across all protocols", total_scraped));
+
+        // Filter to only new configs
+        let mut new_configs: Vec<String> = vec![];
+        for (_, links) in &gathered {
+            for link in links {
+                if !history.sent_at.contains_key(link) && !history.was_tested_recently(link, 60) {
+                    new_configs.push(link.clone());
+                    history.sent_at.insert(link.clone(), Utc::now());
+                }
+            }
+        }
+
+        // Limit to 100 per cycle as requested
+        if new_configs.len() > 100 {
+            log_worker(&tx, LogLevel::Warning, format!("⚠️ Found {} configs, limiting to 100 for this cycle", new_configs.len()));
+            new_configs.truncate(100);
+        }
+
+        // Write outputs
+        if config.output_new_only_enabled && !gathered.is_empty() {
+            let _ = write_new_only(OUTPUT_NEW_DIR, &gathered);
+        }
+        if config.output_append_unique_enabled && !gathered.is_empty() {
+            let _ = write_append_unique(OUTPUT_APPEND_DIR, &gathered);
+        }
+
+        // TESTING PHASE
+        let mut working_count = 0;
+        if config.test_configs_enabled && !new_configs.is_empty() {
+            log_worker(&tx, LogLevel::Info, format!("🧪 Starting testing phase for {} configs...", new_configs.len()));
+
+            let results = test_configs_batch(&new_configs, &config, &mut hot_pool, &mut history, &tx);
+
+            working_count = results.iter().filter(|r| r.success).count();
+
+            // Save working configs
+            let _ = write_working_configs(&results, OUTPUT_WORKING_DIR);
+
+            // Update hot pool
+            let _ = hot_pool.save();
+
+            log_worker(&tx, LogLevel::Success, format!("🏆 Testing complete: {}/{} working", working_count, new_configs.len()));
+        }
+
+        // Add hot pool working configs to output
+        let working_from_pool = hot_pool.get_working(120); // Last 2 hours
+        if !working_from_pool.is_empty() {
+            log_worker(&tx, LogLevel::Info, format!("🔥 Adding {} configs from hot pool", working_from_pool.len()));
+            let pool_results: Vec<TestResult> = working_from_pool.iter().map(|e| TestResult {
+                link: e.link.clone(),
+                endpoint: e.endpoint.clone(),
+                success: true,
+                connect_time_secs: e.avg_connect_time_secs,
+                bytes_transferred: 1000,
+                error: None,
+            }).collect();
+            let _ = write_working_configs(&pool_results, OUTPUT_WORKING_DIR);
+            working_count += working_from_pool.len();
+        }
+
+        // Build stats
+        let mut by_protocol: BTreeMap<String, usize> = BTreeMap::new();
+        for link in &new_configs {
+            if let Some(proto) = link.split("://").next() {
+                *by_protocol.entry(proto.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        let _ = tx.send(AppEvent::Stats { 
+            total: new_configs.len(), 
+            working: working_count, 
+            by_protocol,
+            hot_pool_size: hot_pool.entries.len(),
+        });
+
+        let _ = history.save();
+
+        // Wait for next cycle
+        log_worker(&tx, LogLevel::Info, format!("💤 Cycle complete. Sleeping {} minutes...", config.interval_minutes));
+        for _ in 0..(config.interval_minutes * 60) {
+            if stop.load(Ordering::SeqCst) { break; }
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    Ok(())
+}
+
+fn log_worker(tx: &Sender<AppEvent>, level: LogLevel, text: String) {
+    let _ = tx.send(AppEvent::Log(level, text));
+}
+
 fn parse_channels(raw: &str) -> Vec<String> {
-    raw.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).filter_map(|line| {
-        if let Some(rest) = line.strip_prefix('@') { return Some(rest.to_string()); }
-        if line.contains("t.me/") { return line.split("t.me/").nth(1).map(|x| x.split('?').next().unwrap_or_default().trim_matches('/').to_string()); }
-        Some(line.to_string())
-    }).filter(|s| !s.is_empty()).collect()
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|line| {
+            if let Some(rest) = line.strip_prefix('@') { return Some(rest.to_string()); }
+            if line.contains("t.me/") { 
+                return line.split("t.me/").nth(1).map(|x| x.split('?').next().unwrap_or_default().trim_matches('/').to_string()); 
+            }
+            Some(line.to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
 }
