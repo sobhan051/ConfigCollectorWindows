@@ -194,9 +194,9 @@ impl AppConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SentHistory {
-    #[serde(with = "chrono::serde::ts_seconds")]  // ← Changed here
+    // #[serde(with = "chrono::serde::ts_seconds")]  // ← Changed here
     sent_at: BTreeMap<String, DateTime<Utc>>,
-    #[serde(with = "chrono::serde::ts_seconds")]  // ← Changed here
+    // #[serde(with = "chrono::serde::ts_seconds")]  // ← Changed here
     tested_at: BTreeMap<String, DateTime<Utc>>,
 }
 
