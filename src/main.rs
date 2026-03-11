@@ -426,7 +426,7 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM xray.exe 2>nul"]).creation_flags(CREATE_NO_WINDOW).output();
+        // let _ = Command::new("cmd").args(&["/C", "taskkill /F /IM xray.exe 2>nul"]).creation_flags(CREATE_NO_WINDOW).output();
     }
 }
 
