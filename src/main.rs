@@ -637,32 +637,61 @@ fn build_vmess_outbound(link: &str) -> Option<serde_json::Value> {
 }
 
 fn build_shadowsocks_outbound(link: &str) -> Option<serde_json::Value> {
-    let link = link.strip_prefix("ss://").unwrap_or(link);
-    let (method, password, host, port) = if link.contains('@') && !link.starts_with("http") {
-        let u = Url::parse(&format!("ss://{}", link)).ok()?;
-        let userinfo = u.username();
-        let (m, p) = userinfo.split_once(':')?;
-        (m.to_string(), p.to_string(), u.host_str()?.to_string(), u.port()?)
-    } else {
-        let b64_part = link.split('#').next()?.trim();
-        let decoded = STANDARD.decode(b64_part).ok()?;
-        let s = String::from_utf8_lossy(&decoded);
-        let parts: Vec<&str> = s.split('@').collect();
-        if parts.len() != 2 { return None; }
-        let userpass = parts[0];
-        let (m, p) = userpass.split_once(':')?;
-        let hostport: Vec<&str> = parts[1].split(':').collect();
-        (m.to_string(), p.to_string(), hostport[0].to_string(), hostport[1].parse().ok()?)
-    };
+    let mut clean = link.to_string();
+    if let Some(pos) = clean.find('#') { clean.truncate(pos); }
+    if let Some(pos) = clean.find('?') { clean.truncate(pos); }
 
-    let outbound = json!({
+    let after_ss = clean.strip_prefix("ss://").unwrap_or(&clean);
+
+    // Case 1: Your exact format → base64@ip:port (most common in Telegram now)
+    if let Some((b64_part, host_port)) = after_ss.split_once('@') {
+        if let Ok(decoded) = STANDARD.decode(b64_part) {
+            let decoded_str = String::from_utf8_lossy(&decoded);
+            if let Some((method, password)) = decoded_str.split_once(':') {
+                if let Some((host, port_str)) = host_port.split_once(':') {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        return Some(json!({
+                            "tag": "proxy",
+                            "protocol": "shadowsocks",
+                            "settings": { "servers": [{ "address": host, "port": port, "method": method, "password": password }] }
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Case 2: Full base64 format (ss://base64#remark)
+    if let Ok(decoded) = STANDARD.decode(after_ss) {
+        let s = String::from_utf8_lossy(&decoded);
+        if let Some((userpass, hostport)) = s.split_once('@') {
+            if let Some((method, password)) = userpass.split_once(':') {
+                if let Some((host, port_str)) = hostport.split_once(':') {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        return Some(json!({
+                            "tag": "proxy",
+                            "protocol": "shadowsocks",
+                            "settings": { "servers": [{ "address": host, "port": port, "method": method, "password": password }] }
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Case 3: Plain format (fallback)
+    let u = Url::parse(&format!("ss://{}", after_ss)).ok()?;
+    let userinfo = u.username();
+    let (method, password) = userinfo.split_once(':')?;
+    let host = u.host_str()?.to_string();
+    let port = u.port()?;
+
+    Some(json!({
         "tag": "proxy",
         "protocol": "shadowsocks",
         "settings": { "servers": [{ "address": host, "port": port, "method": method, "password": password }] }
-    });
-    Some(outbound)
+    }))
 }
-
 // =============================================================
 // CHAINED TESTER
 // =============================================================
